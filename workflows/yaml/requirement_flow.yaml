@@ -1,0 +1,130 @@
+# 需求处理工作流
+# 从需求接收到项目交付的完整流程
+#
+# 流程：
+#   CEO(需求分析) → PM(PRD) → [Dev + Design](并行) → Review → Deploy → Finance
+#
+# 借鉴 ChatDev 的图结构 + MetaGPT 的角色定义
+
+version: "1.0"
+
+vars:
+  default_model: "deepseek"
+  project_name: "default"
+
+graph:
+  id: "requirement_to_deploy"
+  description: "从需求到部署的完整流程"
+
+  # 起始节点
+  start_nodes: ["ceo"]
+
+  # 终止节点
+  end_nodes: ["finance"]
+
+  # 节点定义
+  nodes:
+    # CEO：接收需求，分析并分配任务
+    - id: "ceo"
+      type: "agent"
+      role: "ceo"
+      description: "CEO 接收客户需求，分析需求并分配任务给产品经理"
+      config:
+        actions:
+          - "analyze_requirement"
+          - "assign_task"
+
+    # 产品经理：生成 PRD
+    - id: "pm"
+      type: "agent"
+      role: "product_manager"
+      description: "产品经理根据需求分析生成详细的 PRD 文档"
+      config:
+        actions:
+          - "create_prd"
+          - "define_acceptance_criteria"
+
+    # 开发工程师：实现代码
+    - id: "dev"
+      type: "agent"
+      role: "developer"
+      description: "开发工程师根据 PRD 实现代码"
+      config:
+        actions:
+          - "design_architecture"
+          - "implement_feature"
+          - "write_tests"
+
+    # 前端专家：设计并实现前端页面
+    - id: "design"
+      type: "agent"
+      role: "frontend_expert"
+      description: "前端专家根据需求设计并实现高质量前端页面（Next.js + Tailwind + shadcn/ui）"
+      config:
+        actions:
+          - "analyze_requirement"
+          - "setup_project"
+          - "implement_frontend"
+          - "review_and_polish"
+
+    # 代码审查
+    - id: "review"
+      type: "agent"
+      role: "developer"
+      description: "代码审查，确保代码质量"
+      config:
+        actions:
+          - "review_code"
+          - "check_tests"
+
+    # 运维部署
+    - id: "deploy"
+      type: "agent"
+      role: "devops"
+      description: "运维工程师部署应用到生产环境"
+      config:
+        actions:
+          - "deploy_app"
+          - "setup_monitoring"
+
+    # 财务记录
+    - id: "finance"
+      type: "agent"
+      role: "finance"
+      description: "财务人员记录项目成本和收入"
+      config:
+        actions:
+          - "record_cost"
+          - "generate_invoice"
+
+  # 边定义（消息传递路径）
+  edges:
+    # CEO → PM：需求分析完成后，分配给产品经理
+    - source: "ceo"
+      target: "pm"
+      description: "需求分析结果传递给产品经理"
+
+    # PM → Dev + Design：PRD 完成后，并行分配给开发和设计
+    - source: "pm"
+      target: ["dev", "design"]
+      description: "PRD 并行传递给开发和设计"
+
+    # Dev → Review：开发完成后，进行代码审查
+    - source: "dev"
+      target: "review"
+      description: "代码提交审查"
+
+    # Design → Review：设计完成后，也进入审查
+    - source: "design"
+      target: "review"
+      description: "设计成果审查"
+
+    # Review → Deploy：审查通过后，部署
+    - source: "review"
+      target: "deploy"
+      description: "审查通过，部署上线"
+
+    # Deploy → Finance：部署完成后，记录财务
+    - source: "deploy"
+      target: "finance"
+      description: "部署完成，记录财务"

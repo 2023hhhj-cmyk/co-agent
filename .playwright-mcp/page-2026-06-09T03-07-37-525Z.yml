@@ -1,0 +1,247 @@
+- generic [ref=e2]:
+  - generic:
+    - generic:
+      - generic:
+        - generic:
+          - generic [ref=e6]:
+            - generic [ref=e7]:
+              - generic [ref=e8]: 新鲜事一网打尽
+              - generic [ref=e9]: X 上的用户能够抢先知道。
+            - generic [ref=e12]:
+              - link "登录" [ref=e14] [cursor=pointer]:
+                - /url: /login
+                - generic [ref=e17]: 登录
+              - link "注册" [ref=e19] [cursor=pointer]:
+                - /url: /i/flow/signup
+                - generic [ref=e22]: 注册
+          - generic [ref=e24]:
+            - generic [ref=e25]:
+              - generic [ref=e26]: 有人说…Cookie 吗？
+              - generic [ref=e27]:
+                - text: X 及其合作伙伴使用 Cookie 为你提供更好、更安全、更快捷的服务，并为我们的业务提供支持。有些 Cookie 是使用和改进我们的服务以及确保其正常运作所必需的。
+                - button "显示更多关于你的选项的信息。" [ref=e28]
+            - generic [ref=e29]:
+              - button "接受所有 Cookie" [ref=e30] [cursor=pointer]:
+                - generic [ref=e33]: 接受所有 Cookie
+              - button "拒绝非必要的 Cookie" [ref=e34] [cursor=pointer]:
+                - generic [ref=e37]: 拒绝非必要的 Cookie
+      - generic [ref=e38]:
+        - button "跳至主页时间线" [ref=e39] [cursor=pointer]
+        - button "跳至当前趋势" [ref=e41] [cursor=pointer]
+        - banner [ref=e43]:
+          - generic [ref=e46]:
+            - heading "X" [level=1] [ref=e48] [cursor=pointer]:
+              - link "X" [ref=e49]:
+                - /url: /
+                - img [ref=e51]
+            - generic:
+              - navigation "主要"
+        - main [ref=e54]:
+          - generic [ref=e57]:
+            - generic "主页时间线" [ref=e59]:
+              - generic [ref=e60]:
+                - generic [ref=e66] [cursor=pointer]:
+                  - button "返回" [ref=e68]:
+                    - img [ref=e70]
+                  - heading "帖子" [level=2] [ref=e75]
+                - generic:
+                  - generic:
+                    - status:
+                      - button:
+                        - generic:
+                          - img
+                          - generic: 查看新帖子
+              - region "对话" [ref=e77]:
+                - heading "对话" [level=1] [ref=e78]
+                - generic "时间线：对话" [ref=e79]:
+                  - article [ref=e84]:
+                    - generic [ref=e86]:
+                      - generic [ref=e90]:
+                        - link [active] [ref=e102] [cursor=pointer]:
+                          - /url: /shao__meng
+                        - generic [ref=e107]:
+                          - generic [ref=e110]:
+                            - link "meng shao 认证账号" [ref=e113] [cursor=pointer]:
+                              - /url: /shao__meng
+                              - generic [ref=e114]:
+                                - generic [ref=e116]: meng shao
+                                - img "认证账号" [ref=e119]
+                            - link "@shao__meng" [ref=e125] [cursor=pointer]:
+                              - /url: /shao__meng
+                              - generic [ref=e126]: "@shao__meng"
+                          - button "更多" [ref=e132] [cursor=pointer]:
+                            - img [ref=e136]
+                      - generic [ref=e139]:
+                        - generic [ref=e141]:
+                          - generic [ref=e142]: 推荐 Top10：面向 前端 / 产品 / UI 的 Agent Skills 这 10 个 Skills 考虑到设计落地频率、对视觉/交互质量的直接提升、在 Codex/Claude Code 等的高复用性。 1. frontend-skill 来自 OpenAI，适合做 landing page、品牌页、demo 页。强项是视觉论点、内容节奏、首屏质量。
+                          - link "github.com/openai/skills/" [ref=e143] [cursor=pointer]:
+                            - /url: https://t.co/baJxfqhRyf
+                            - text: github.com/openai/skills/
+                            - generic [ref=e144]: …
+                          - generic [ref=e145]: 2. frontend-design 来自 Anthropic，更偏“高完成度、强风格”的前端设计实现。适合你想把页面做得更有辨识度时用。
+                          - link "github.com/anthropics/ski" [ref=e146] [cursor=pointer]:
+                            - /url: https://t.co/mWGc9UNNXa
+                            - text: github.com/anthropics/ski
+                            - generic [ref=e147]: …
+                          - generic [ref=e148]: 3. figma-implement-design 来自 OpenAI，设计稿到代码的核心 skill。凡是产品/设计/前端协作，这个都应该是常用项。
+                          - link "github.com/openai/skills/" [ref=e149] [cursor=pointer]:
+                            - /url: https://t.co/WoM1lKKlM2
+                            - text: github.com/openai/skills/
+                            - generic [ref=e150]: …
+                          - generic [ref=e151]: 4. web-design-guidelines 来自 Vercel，做 UI 审查非常强。可访问性、表单、动效、排版、交互细节，都能系统性补漏。
+                          - link "github.com/vercel-labs/ag" [ref=e152] [cursor=pointer]:
+                            - /url: https://t.co/WzJU5PmwH7
+                            - text: github.com/vercel-labs/ag
+                            - generic [ref=e153]: …
+                          - generic [ref=e154]: 5. react-best-practices 来自 Vercel，如果你做 React / Next.js，这个基本必装。它提升的是“实现质量”和“性能质量”。
+                          - link "github.com/vercel-labs/ag" [ref=e155] [cursor=pointer]:
+                            - /url: https://t.co/rx339BypwV
+                            - text: github.com/vercel-labs/ag
+                            - generic [ref=e156]: …
+                          - generic [ref=e157]: 6. playwright 来自 OpenAI，前端不是只写代码，还要验证真实浏览器行为。这个是 UI 流程调试和回归检查的通用执行层。
+                          - link "github.com/openai/skills/" [ref=e158] [cursor=pointer]:
+                            - /url: https://t.co/PlzxDLkmQC
+                            - text: github.com/openai/skills/
+                            - generic [ref=e159]: …
+                          - generic [ref=e160]: 7. webapp-testing 来自 Anthropic，比 playwright 更贴近日常本地应用验证，适合检查页面行为、截图、日志和交互回归。
+                          - link "github.com/anthropics/ski" [ref=e161] [cursor=pointer]:
+                            - /url: https://t.co/XMlMJlr6bM
+                            - text: github.com/anthropics/ski
+                            - generic [ref=e162]: …
+                          - generic [ref=e163]: 8. canvas-design 来自 Anthropic，适合更自由的视觉探索、展示型页面、画布式交互或概念设计，不是每个项目都需要，但做创意产品页很有价值。
+                          - link "github.com/anthropics/ski" [ref=e164] [cursor=pointer]:
+                            - /url: https://t.co/GnxQxNNcfb
+                            - text: github.com/anthropics/ski
+                            - generic [ref=e165]: …
+                          - generic [ref=e166]: 9. brand-guidelines 来自 Anthropic，如果你在做官网、营销页、设计系统、品牌一致性，这个比单纯“写 UI”更上层，适合产品/品牌协同。
+                          - link "github.com/anthropics/ski" [ref=e167] [cursor=pointer]:
+                            - /url: https://t.co/Ks7fz9L2VX
+                            - text: github.com/anthropics/ski
+                            - generic [ref=e168]: …
+                          - generic [ref=e169]: 10. vercel-deploy-claimable 来自 Vercel，严格说它不是设计 skill，但对前端/产品工作流非常关键。做完页面立刻可部署预览，反馈闭环会快很多。
+                          - link "github.com/vercel-labs/ag" [ref=e170] [cursor=pointer]:
+                            - /url: https://t.co/nb5HL6himn
+                            - text: github.com/vercel-labs/ag
+                            - generic [ref=e171]: …
+                          - generic [ref=e172]: "- 怎么选？- · 偏品牌官网/营销页：frontend-skill、frontend-design、brand-guidelines · 偏产品 UI/设计稿还原：figma-implement-design、react-best-practices、web-design-guidelines · 偏交互验证/可用性：playwright、webapp-testing · 偏创意探索：canvas-design"
+                        - link "图像" [ref=e180] [cursor=pointer]:
+                          - /url: /shao__meng/status/2035316234271764654/photo/1
+                          - generic "图像" [ref=e184]:
+                            - img "图像" [ref=e186]
+                        - generic [ref=e190]:
+                          - link "下午7:22 · 2026年3月21日" [ref=e192] [cursor=pointer]:
+                            - /url: /shao__meng/status/2035316234271764654
+                            - time [ref=e193]: 下午7:22 · 2026年3月21日
+                          - generic [ref=e194]: ·
+                          - link "5.9万 查看" [ref=e195] [cursor=pointer]:
+                            - /url: /shao__meng/status/2035316234271764654/analytics
+                            - generic [ref=e198]: 5.9万
+                            - generic [ref=e199]: 查看
+                        - group "21 回复、228 次转帖、865 喜欢、1236 书签、59980 次观看" [ref=e202]:
+                          - button "21 回复。回复" [ref=e204] [cursor=pointer]:
+                            - generic [ref=e205]:
+                              - img [ref=e208]
+                              - generic [ref=e213]: "21"
+                          - button "228 次转帖。转帖" [ref=e215] [cursor=pointer]:
+                            - generic [ref=e216]:
+                              - img [ref=e219]
+                              - generic [ref=e224]: "228"
+                          - button "865 喜欢次数。喜欢" [ref=e226] [cursor=pointer]:
+                            - generic [ref=e227]:
+                              - img [ref=e230]
+                              - generic [ref=e235]: "865"
+                          - button "1236 书签。加入书签" [ref=e237] [cursor=pointer]:
+                            - generic [ref=e238]:
+                              - img [ref=e241]
+                              - generic [ref=e246]: 1,236
+                          - button "分享帖子" [ref=e249] [cursor=pointer]:
+                            - img [ref=e253]
+                        - button "查看 21 条回复" [ref=e256] [cursor=pointer]:
+                          - generic [ref=e257]:
+                            - img [ref=e258]
+                            - generic [ref=e262]: 查看 21 条回复
+            - generic "当前趋势" [ref=e267]:
+              - generic [ref=e268]:
+                - region "注册" [ref=e270]:
+                  - heading "X 的新用户？" [level=2] [ref=e272]:
+                    - generic [ref=e273]: X 的新用户？
+                  - generic [ref=e274]: 立即注册，获取你自己的个性化时间线！
+                  - generic [ref=e275]:
+                    - generic [ref=e277]:
+                      - button "使用 Google 账号注册。在新标签页中打开" [ref=e279] [cursor=pointer]:
+                        - generic [ref=e281]:
+                          - img [ref=e283]
+                          - generic [ref=e290]: 使用 Google 账号注册
+                      - iframe
+                    - button "使用 Apple 注册" [ref=e291] [cursor=pointer]:
+                      - generic [ref=e292]:
+                        - img [ref=e293]
+                        - generic [ref=e297]: 使用 Apple 注册
+                    - link "创建账号" [ref=e298] [cursor=pointer]:
+                      - /url: /i/flow/signup
+                      - generic [ref=e301]: 创建账号
+                  - generic [ref=e302]:
+                    - text: 注册即表示同意
+                    - link "服务条款" [ref=e303] [cursor=pointer]:
+                      - /url: https://x.com/tos
+                    - text: 及
+                    - link "隐私政策" [ref=e304] [cursor=pointer]:
+                      - /url: https://x.com/privacy
+                    - text: ，其中包括
+                    - link "Cookie 使用条款" [ref=e305] [cursor=pointer]:
+                      - /url: https://help.x.com/rules-and-policies/twitter-cookies
+                    - text: 。
+                - complementary "相关用户" [ref=e307]:
+                  - heading "相关用户" [level=2] [ref=e309]:
+                    - generic [ref=e310]: 相关用户
+                  - list [ref=e311]:
+                    - listitem [ref=e312] [cursor=pointer]:
+                      - generic [ref=e313]:
+                        - link [ref=e323]:
+                          - /url: /shao__meng
+                        - generic [ref=e326]:
+                          - generic [ref=e327]:
+                            - generic [ref=e329]:
+                              - link "meng shao 认证账号" [ref=e331]:
+                                - /url: /shao__meng
+                                - generic [ref=e332]:
+                                  - generic [ref=e334]: meng shao
+                                  - img "认证账号" [ref=e337]
+                              - link "@shao__meng" [ref=e342]:
+                                - /url: /shao__meng
+                                - generic [ref=e344]: "@shao__meng"
+                            - button "关注 @shao__meng" [ref=e346]:
+                              - generic [ref=e349]: 关注
+                          - generic [ref=e350]: Building AI Agents for design & media. 分享新产品、开源项目，以及 AI 创业与职场观察。 公众号 / 小红书：AI 启蒙小伙伴｜合作请私信
+                - generic [ref=e352]:
+                  - generic [ref=e353]: 出错了。请尝试重新加载。
+                  - button "重试" [ref=e354] [cursor=pointer]:
+                    - generic [ref=e355]:
+                      - img [ref=e356]
+                      - generic [ref=e360]: 重试
+                - navigation "页脚" [ref=e362]:
+                  - generic [ref=e363]:
+                    - link "服务条款" [ref=e364] [cursor=pointer]:
+                      - /url: https://x.com/tos
+                    - generic [ref=e365]: "|"
+                  - generic [ref=e366]:
+                    - link "隐私政策" [ref=e367] [cursor=pointer]:
+                      - /url: https://x.com/privacy
+                    - generic [ref=e368]: "|"
+                  - generic [ref=e369]:
+                    - link "Cookie 政策" [ref=e370] [cursor=pointer]:
+                      - /url: https://support.x.com/articles/20170514
+                    - generic [ref=e371]: "|"
+                  - generic [ref=e372]:
+                    - link "辅助功能" [ref=e373] [cursor=pointer]:
+                      - /url: https://help.x.com/resources/accessibility
+                    - generic [ref=e374]: "|"
+                  - generic [ref=e375]:
+                    - link "广告信息" [ref=e376] [cursor=pointer]:
+                      - /url: https://business.x.com/en/help/troubleshooting/how-twitter-ads-work.html?ref=web-twc-ao-gbl-adsinfo&utm_source=twc&utm_medium=web&utm_campaign=ao&utm_content=adsinfo
+                    - generic [ref=e377]: "|"
+                  - button "更多" [ref=e378] [cursor=pointer]:
+                    - generic [ref=e379]:
+                      - text: 更多
+                      - img [ref=e380]
+                  - generic [ref=e383]: © 2026 X Corp.
