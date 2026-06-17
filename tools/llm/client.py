@@ -1,7 +1,7 @@
 """
 LLM 客户端封装
 
-统一接口支持 DeepSeek 和 Claude，提供：
+统一接口支持 DeepSeek，提供：
 - chat: 基础对话
 - chat_with_json: 结构化 JSON 输出
 - chat_with_tools: 工具调用

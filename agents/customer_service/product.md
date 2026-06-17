@@ -30,7 +30,7 @@ MuZhu-AI 是一家专注于为中小企业打造 Agent 平台的公司，通过�
 
 ### 技术栈
 
-- **LLM**：DeepSeek（主）+ Claude（辅）
+- **LLM**：DeepSeek
 - **Agent 编排**：自研（MetaGPT 角色 + ChatDev 图工作流）
 - **消息通信**：企业微信 + 飞书
 - **状态存储**：Redis + PostgreSQL

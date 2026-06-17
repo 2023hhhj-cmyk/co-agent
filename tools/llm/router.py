@@ -1,15 +1,14 @@
 """
-LLM 路由器 - 混合策略选择
+LLM 路由器 - 策略选择
 
 根据任务类型选择合适的 LLM：
-- DeepSeek（主）：简单代码、CRUD、日常任务
-- Claude（辅）：复杂推理、代码审查、架构设计
+- DeepSeek：所有任务统一使用
 """
 
 import logging
 from enum import Enum
 
-from tools.llm.client import ClaudeClient, DeepSeekClient, LLMClient
+from tools.llm.client import DeepSeekClient, LLMClient
 
 logger = logging.getLogger(__name__)
 
@@ -29,9 +28,9 @@ class TaskType(str, Enum):
 # 任务类型到 LLM 的映射
 TASK_LLM_MAP: dict[TaskType, str] = {
     TaskType.SIMPLE_CODE: "deepseek",
-    TaskType.COMPLEX_CODE: "claude",
-    TaskType.CODE_REVIEW: "claude",
-    TaskType.ARCHITECTURE: "claude",
+    TaskType.COMPLEX_CODE: "deepseek",
+    TaskType.CODE_REVIEW: "deepseek",
+    TaskType.ARCHITECTURE: "deepseek",
     TaskType.PRD: "deepseek",
     TaskType.DESIGN: "deepseek",
     TaskType.DOCUMENT: "deepseek",
@@ -64,8 +63,6 @@ class LLMRouter:
         if provider not in self._clients:
             if provider == "deepseek":
                 self._clients[provider] = DeepSeekClient()
-            elif provider == "claude":
-                self._clients[provider] = ClaudeClient()
             else:
                 raise ValueError(f"Unknown LLM provider: {provider}")
         return self._clients[provider]

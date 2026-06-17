@@ -48,7 +48,7 @@ WorkflowGraph → WorkflowExecutor（拓扑排序，分层并行）
     ↓
 Agent 执行层 (MetaGPT Think-Act-Observe)
     ↓
-工具层（LLM Router → DeepSeek/Claude）
+工具层（LLM Router → DeepSeek）
 ```
 
 ### 工作流引擎（`workflows/`）
@@ -78,7 +78,7 @@ Agent 执行层 (MetaGPT Think-Act-Observe)
 
 - **LLMRouter**（`router.py`）：Agent 角色 → 任务类型 → LLM 提供者
   - DeepSeek（主）：简单代码、PRD、设计、文档、通用任务
-  - Claude（辅）：复杂代码、代码审查、架构设计
+  - DeepSeek：全部任务统一处理
 - 两个客户端（`client.py`）均为 httpx 原生调用，非 OpenAI/Anthropic SDK 封装
 - **PromptManager**（`prompt.py`）：管理 system/action prompt 模板
 

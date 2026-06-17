@@ -13,7 +13,7 @@
      ↓
   Agent 执行层（Think-Act-Observe 循环）
      ↓
-  工具层（LLM Router → DeepSeek / Claude）
+  工具层（LLM Router → DeepSeek）
      ↓
   DevOps（Docker + Nginx 自动部署）
 ```
@@ -25,7 +25,7 @@
 | 框架 | FastAPI + Uvicorn |
 | 数据库 | PostgreSQL（asyncpg） |
 | 缓存 | Redis + ChromaDB（向量存储） |
-| LLM | DeepSeek（主）+ Claude（辅） |
+| LLM | DeepSeek |
 | 消息 | 飞书 WebSocket + 企业微信回调 |
 | 部署 | Docker + Nginx 反向代理 |
 | 可观测性 | Prometheus + OpenTelemetry |

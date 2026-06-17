@@ -142,7 +142,7 @@ Layer 3: [finance]       # 财务记录
 
 | 层次 | 技术 |
 |------|------|
-| LLM | DeepSeek（主）+ Claude（辅） |
+| LLM | DeepSeek |
 | Agent编排 | 自研（MetaGPT + ChatDev 融合） |
 | 消息通信 | 内存 MessageBus（发布/订阅） |
 | 飞书接入 | lark-oapi SDK（WebSocket 长连接） |
@@ -187,7 +187,7 @@ co-agent/
 ├── communication/         # 消息系统
 │   └── message_bus.py    # 消息总线（发布/订阅）
 ├── tools/llm/             # LLM工具
-│   ├── client.py         # DeepSeek/Claude客户端
+│   ├── client.py         # DeepSeek 客户端
 │   ├── router.py         # LLM路由器
 │   └── prompt.py         # 提示词管理
 ├── tools/code/            # 代码工具
@@ -243,13 +243,13 @@ co-agent/
 
 ---
 
-## LLM混合策略
+## LLM策略
 
 | 场景 | 使用 | 原因 |
 |------|------|------|
-| 代码审查、复杂bug修复 | Claude | 理解能力更强 |
-| 简单代码生成、重构 | DeepSeek | 够用且便宜 |
-| 架构设计、技术方案 | Claude | 推理能力更强 |
+| 代码审查、复杂bug修复 | DeepSeek | 统一模型，简化架构 |
+| 简单代码生成、重构 | DeepSeek | 性价比高 |
+| 架构设计、技术方案 | DeepSeek | 统一模型，简化架构 |
 | 日常编码、CRUD | DeepSeek | 性价比高 |
 | 实际产品构建 | Claude Code CLI | 通过 CC Switch 配置模型，支持并行执行 |
 | CEO 任务拆解 | DeepSeek | 需要结构化 JSON 输出 |
