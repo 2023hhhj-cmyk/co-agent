@@ -33,7 +33,7 @@ psql -h localhost -U muzhu -d muzhu_agent -f scripts/init_db.sql
 
 ## 环境变量
 
-在 `.env` 中配置（模板见 `.env.example`）。至少需要设置 `DEEPSEEK_API_KEY` 或 `ANTHROPIC_API_KEY`，否则 LLM 调用无法工作。
+在 `.env` 中配置（模板见 `.env.example`）。需要设置 `DEEPSEEK_API_KEY`，否则 LLM 调用无法工作。
 
 关键配置：`HOST`、`PORT`（默认8080）、`DATABASE_URL`、`REDIS_URL`、`CHROMA_HOST`。
 
@@ -76,10 +76,8 @@ Agent 执行层 (MetaGPT Think-Act-Observe)
 
 ### LLM 路由（`tools/llm/`）
 
-- **LLMRouter**（`router.py`）：Agent 角色 → 任务类型 → LLM 提供者
-  - DeepSeek（主）：简单代码、PRD、设计、文档、通用任务
-  - DeepSeek：全部任务统一处理
-- 两个客户端（`client.py`）均为 httpx 原生调用，非 OpenAI/Anthropic SDK 封装
+- **LLMRouter**（`router.py`）：Agent 角色 → 任务类型 → LLM 提供者（全部路由至 DeepSeek）
+- 客户端（`client.py`）为 httpx 原生调用，非 OpenAI SDK 封装
 - **PromptManager**（`prompt.py`）：管理 system/action prompt 模板
 
 ### 部署工具（`tools/deploy/`）
