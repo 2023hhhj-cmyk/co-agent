@@ -290,7 +290,7 @@ co-agent/
 
 ## 项目进度
 
-**最后更新**：2026-06-15
+**最后更新**：2026-06-17
 
 | 阶段 | 状态 | 说明 |
 |------|------|------|
@@ -303,6 +303,9 @@ co-agent/
 | Phase 7: 可观测性 | ✅ 完成 | JSON结构化日志 + Prometheus指标 + 增强健康检查 + 告警规则 |
 | Phase 8: 系统测试 | ✅ 完成 | pytest 37个测试用例 (单元25 + 集成12) |
 | Phase 9: 加速层 | ✅ 完成 | LLM响应缓存(Redis) + Prompt压缩 + 嵌入缓存 |
+| Phase 10: 安全加固 | ✅ 完成 | 严重/高危/中危漏洞修复，详见更新日志 |
+| Phase 11: LLM 简化 | ✅ 完成 | Claude API 移除，统一使用 DeepSeek |
+| Phase 12: 代码托管 | ✅ 完成 | GitHub 私有仓库，敏感信息清理 |
 
 ### Agent 完成状态
 
@@ -491,6 +494,65 @@ pytest 37个测试用例，覆盖全部核心模块。
 | InputGuard | test_input_guard.py | 6 | 单元 |
 | PolicyEnforcer | test_access.py | 5 | 单元 |
 | API Endpoints | test_endpoints.py | 4 | 集成 |
+
+---
+
+## 更新日志
+
+### 2026-06-17 — LLM 简化 + 安全升级
+
+**LLM 架构简化**
+- 所有 LLM 路由统一使用 DeepSeek，移除 Claude API 作为辅助模型
+- `router.py`：全部任务类型映射至 DeepSeek
+- `__init__.py`：移除 ClaudeClient 导出
+- 保留 Claude Code CLI（代码生成命令行工具）不受影响
+
+**代码托管**
+- 创建 GitHub 私有仓库 `2023hhhj-cmyk/co-agent`
+- 清理 Git 历史：删除 `.env`、`venv/`、敏感配置文件残留
+- `.env.example` 脱敏：真实 IP/密码替换为占位符
+- 添加 `README.md` 项目说明
+
+---
+
+### 2026-06-16 — 安全漏洞修复（严重 + 高危）
+
+**严重漏洞（Critical）**
+| 漏洞 | 修复 |
+|------|------|
+| `eval()` 任意代码执行 | AST 白名单求值器替代 `eval()`，阻止沙箱逃逸 |
+| 6 处硬编码密码 | 删除源码中所有数据库/Redis 密码，改为环境变量 |
+| 路径遍历（customer_name） | `_safe_path()` + `realpath()` 校验 |
+| 符号链接遍历 | `os.path.islink()` 跳过 + 路径验证 |
+| Docker 挂载注入 | `_validate_working_dir()` + 白名单限制 |
+
+**高危漏洞（High）**
+| 漏洞 | 修复 |
+|------|------|
+| CORS 通配符+凭证 | 改为 `CORS_ORIGINS` 白名单 |
+| 飞书 Webhook 无签名验证 | HMAC-SHA256 签名验证 |
+| 所有 API 无认证 | `X-API-Key` 中间件 |
+| 无速率限制 | `slowapi` 全局 60/min + Webhook 120/min |
+| 无 TLS | SSL 证书配置支持 |
+| SSH HostKeyChecking 禁用 | 删除 + host key 预检查 |
+
+---
+
+### 2026-06-17 — 安全漏洞修复（中危）
+
+| 问题 | 修复 |
+|------|------|
+| API 错误消息泄露内部路径 | 7 处 `str(e)` 改为通用错误消息 |
+| 健康检查暴露依赖详情 | 仅返回 `healthy`/`degraded` |
+| Metrics 暴露 Python 进程信息 | 自定义 `CollectorRegistry` |
+| 缺少安全 HTTP 头 | `nosniff` + `DENY` + `HSTS` |
+| LLM 日志可能含 API Key | 脱敏：仅记录错误类型 |
+| 缓存键 SHA-256 截断碰撞 | 16→32 位 hex（128 bit） |
+| 缓存 invalidate 空壳 | SCAN+DELETE 实现 |
+| 嵌入缓存 TTL 过短 | 1h→24h |
+| Redis key 注入 | `agent_id`/`task_id`/`chat_id` 白名单校验 |
+| 数据库连接池无上限 | `min_size=2, max_size=20` |
+| `print()` 散落 | 统一改为 `logger` |
 
 ---
 
