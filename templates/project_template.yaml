@@ -31,6 +31,7 @@ agent_capabilities:
       调用 Claude Code 构建实际可运行的产品，包括：架构设计、代码实现、项目配置、README。
     output: "可运行的代码项目 + 成果摘要文档"
     sync: false  # 复杂任务，异步执行
+    task_timeout: 900  # 15 分钟
 
   frontend_expert:
     name: "前端专家"
@@ -39,18 +40,21 @@ agent_capabilities:
       能从口头需求生成美观、响应式、可生产的前端代码，包含完整项目结构和组件。
     output: "可运行的前端项目 + 成果摘要文档"
     sync: false  # 复杂任务，异步执行
+    task_timeout: 900  # 15 分钟
 
   devops:
     name: "运维工程师"
     capabilities: "部署应用、配置监控、生成部署报告"
     output: "部署报告"
     sync: true
+    task_timeout: 300  # 5 分钟
 
   finance:
     name: "财务人员"
     capabilities: "成本记录、账单生成、财务报表"
     output: "财务报告和账单"
     sync: true
+    task_timeout: 120  # 2 分钟
 
 # 任务拆解规则
 decomposition_rules:

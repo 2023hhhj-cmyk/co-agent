@@ -7,9 +7,19 @@ from pydantic_settings import BaseSettings
 class Settings(BaseSettings):
     HOST: str = "0.0.0.0"
     PORT: int = 8080
-    DATABASE_URL: str = "postgresql://muzhu:muzhu_pg_2024@localhost:5432/muzhu_agent"
-    REDIS_URL: str = "redis://:muzhu_redis_2024@localhost:6379/0"
+    DATABASE_URL: str = ""
+    REDIS_URL: str = ""
+
+    # 安全配置
+    API_KEY: str = ""                           # API 认证密钥（空=开发模式，不校验）
+    CORS_ORIGINS: list[str] = ["http://localhost:3000"]  # 允许的跨域来源
+    RATE_LIMIT: str = "60/minute"               # 全局限速
+    SSL_CERT_FILE: str = ""                     # TLS 证书路径
+    SSL_KEY_FILE: str = ""                      # TLS 私钥路径
+    # ChromaDB 配置
     CHROMADB_URL: str = "http://localhost:8000"
+    CHROMA_COLLECTION_NAME: str = "agent_knowledge"
+    EMBEDDING_MODEL: str = "all-MiniLM-L6-v2"
     DEEPSEEK_API_KEY: str = ""
     DEEPSEEK_BASE_URL: str = "https://api.deepseek.com/v1"
     DEEPSEEK_MODEL: str = "deepseek-v4-pro"

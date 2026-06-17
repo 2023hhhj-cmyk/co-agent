@@ -31,6 +31,9 @@ from models.task import ProjectPlan, Task, TaskStatus
 from tools.code.claude_code import ClaudeCodeTool
 from tools.llm.client import LLMClient
 from tools.llm.prompt import PromptManager
+from workflows.converter import PlanToGraphConverter
+from workflows.executor import WorkflowExecutor
+from workflows.graph import WorkflowGraph
 
 logger = logging.getLogger(__name__)
 
@@ -79,15 +82,23 @@ class CEOAgent(BaseAgent):
         feishu_client: Optional[FeishuClient] = None,
         team: Optional[dict[str, Any]] = None,
         base_dir: str = "/root",
+        memory_manager: Any = None,
+        state_manager: Any = None,
+        input_guard: Any = None,
+        **kwargs,
     ):
         super().__init__(
             role=CEO_ROLE,
             llm_client=llm_client,
             message_bus=message_bus,
+            memory_manager=memory_manager,
+            **kwargs,
         )
         self.feishu = feishu_client
         self.team = team or {}  # role_name -> agent instance
         self.base_dir = base_dir
+        self.state_manager = state_manager  # 用于 _active_plans 持久化
+        self.input_guard = input_guard  # 输入校验器
 
         # Claude Code 工具（用于浏览项目代码，优先级低于项目文件）
         self.claude_code = ClaudeCodeTool(
@@ -163,6 +174,19 @@ class CEOAgent(BaseAgent):
         self._current_chat_type = chat_type
 
         logger.info(f"CEO 收到飞书消息: chat_id={chat_id}, text={text[:50]}...")
+
+        # 输入安全校验
+        if self.input_guard:
+            result = self.input_guard.validate(text, source="feishu")
+            if not result.allowed:
+                logger.warning(f"[InputGuard] 飞书消息被拒绝: {result.reason}")
+                await self._send_feishu_text(chat_id, "抱歉，您的消息包含不被允许的内容。")
+                if self.audit_logger:
+                    await self.audit_logger.log_input_rejected(
+                        text, "feishu", result.reason, result.flags, self.agent_id,
+                    )
+                return
+            text = result.content
 
         # 立刻回复"收到"，让用户知道消息已收到
         await self._send_feishu_text(chat_id, "收到，正在处理...")
@@ -263,6 +287,8 @@ class CEOAgent(BaseAgent):
 
         # 保存计划
         self._active_plans[chat_id] = plan
+        # 持久化到 Redis（带 fallback）
+        await self._save_active_plan(chat_id, plan)
 
         # 发送确认卡片
         card = plan.to_confirm_card()
@@ -353,7 +379,11 @@ Developer 使用 Claude Code 构建产品，它需要清晰的输入。给 Devel
   ]
 }}
 
-assigned_to 可选值：developer, frontend_expert, devops, finance"""
+## 重要规则
+- assigned_to 可选值：developer, frontend_expert, devops, finance
+- dependencies 必须填写其他任务的 title（不是 id，不是序号），例如：["开发后端API", "做前端页面"]
+- 如果没有依赖，dependencies 为 []
+- 每个任务的 title 必须唯一"""
 
         messages = [
             {"role": "system", "content": system_prompt},
@@ -474,106 +504,83 @@ assigned_to 可选值：developer, frontend_expert, devops, finance"""
     # ========== 任务执行 ==========
 
     async def _execute_plan(self, chat_id: str, plan: ProjectPlan) -> None:
-        """按依赖关系执行任务计划"""
+        """
+        执行任务计划
+
+        流程：
+        1. 把 ProjectPlan 转成动态 DAG（PlanToGraphConverter）
+        2. 创建 WorkflowExecutor，注入进度回调
+        3. 执行 DAG，各 Agent 由 Executor 调度
+        4. 汇总报告
+        5. 归档项目记忆
+        """
         plan.status = "executing"
         await self._send_feishu_text(chat_id, "✅ 已确认！开始执行任务...")
 
-        # 按依赖层级执行
-        while not plan.is_all_done():
-            ready_tasks = plan.get_ready_tasks()
-            if not ready_tasks:
-                # 没有就绪任务但也没全部完成 → 可能有失败导致的死锁
-                running = plan.get_running_tasks()
-                if not running:
-                    logger.error("任务执行死锁：无就绪任务也无运行中任务")
-                    await self._send_feishu_text(chat_id, "⚠️ 任务执行出现问题，请检查。")
-                    break
-                # 等待运行中的任务
-                await asyncio.sleep(2)
-                continue
-
-            # 标记为运行中
-            for task in ready_tasks:
-                task.mark_running()
-
-            # 通知用户开始执行
-            task_names = ", ".join(t.title for t in ready_tasks)
-            await self._send_feishu_text(chat_id, f"🔄 正在执行: {task_names}")
-
-            # 并行执行就绪任务
-            execution_tasks = [
-                self._execute_single_task(chat_id, plan, task)
-                for task in ready_tasks
-            ]
-            await asyncio.gather(*execution_tasks, return_exceptions=True)
-
-        # 全部完成，汇总报告
-        plan.status = "completed"
-        plan.completed_at = datetime.now()
-        await self._send_completion_report(chat_id, plan)
-
-    async def _execute_single_task(
-        self, chat_id: str, plan: ProjectPlan, task: Task
-    ) -> None:
-        """执行单个任务"""
-        agent = self.team.get(task.assigned_to)
-        if not agent:
-            task.mark_failed(f"Agent {task.assigned_to} 不可用")
-            await self._send_feishu_text(chat_id, f"❌ 任务 [{task.title}] 失败: Agent {task.assigned_to} 不可用")
-            return
-
-        logger.info(f"执行任务: {task.title} -> {task.assigned_to}")
-
         try:
-            # 构造输入消息
-            # 收集依赖任务的结果作为上下文
-            context_parts = [f"任务: {task.title}\n要求: {task.description}"]
-            for dep_id in task.dependencies:
-                dep_task = plan.get_task(dep_id)
-                if dep_task and dep_task.result:
-                    context_parts.append(f"前置任务 [{dep_task.title}] 的结果:\n{dep_task.result}")
+            # 1. ProjectPlan → 动态 DAG
+            converter = PlanToGraphConverter()
+            graph_def = converter.convert(plan)
+            graph = WorkflowGraph(graph_def)
 
-            input_message = Message(
-                content="\n\n---\n\n".join(context_parts),
-                cause_by="ceo_task_assignment",
-                sent_from=self.agent_id,
-                send_to={task.assigned_to},
-                metadata={
-                    "plan_id": plan.id,
-                    "task_id": task.id,
-                    "requirement": plan.requirement,
+            # 2. 构建额外上下文（任务描述 + 元数据）
+            extra_context = {
+                "task_descriptions": {t.id: t.description for t in plan.tasks},
+                "task_metadata": {
+                    t.id: {
+                        "plan_id": plan.id,
+                        "task_id": t.id,
+                        "task_title": t.title,
+                        "requirement": plan.requirement,
+                    }
+                    for t in plan.tasks
                 },
+            }
+
+            # 3. 进度回调：每完成一个节点，更新 plan 并通知飞书
+            async def on_progress(node_id: str, result: Message) -> None:
+                task = plan.get_task(node_id)
+                if task:
+                    result_text = result.content if result else "任务已完成"
+                    task.mark_completed(result_text[:500])
+                    await self._send_feishu_text(chat_id, f"✅ 任务 [{task.title}] 已完成")
+
+            # 4. 创建 Executor 并执行
+            executor = WorkflowExecutor(
+                graph=graph,
+                agents=self.team,
+                on_progress=on_progress,
             )
 
-            # 混合模式执行
-            agent_info = self.template.get("agent_capabilities", {}).get(task.assigned_to, {})
-            is_sync = agent_info.get("sync", True)
+            input_message = Message(
+                content=plan.requirement,
+                cause_by="user_requirement",
+                sent_from="user",
+                send_to={"*"},
+            )
 
-            if is_sync:
-                # 同步执行（简单 Agent）
-                result = await asyncio.wait_for(
-                    agent.run(input_message),
-                    timeout=300,  # 5 分钟超时
-                )
-            else:
-                # 异步执行（复杂 Agent，如 Developer）
-                result = await asyncio.wait_for(
-                    agent.run(input_message),
-                    timeout=900,  # 15 分钟超时
-                )
+            await executor.execute(input_message, extra_context=extra_context)
 
-            # 记录结果
-            result_text = result.content if result else "任务已完成"
-            task.mark_completed(result_text[:500])
-            await self._send_feishu_text(chat_id, f"✅ 任务 [{task.title}] 已完成")
-
-        except asyncio.TimeoutError:
-            task.mark_failed("执行超时")
-            await self._send_feishu_text(chat_id, f"⏰ 任务 [{task.title}] 执行超时")
         except Exception as e:
-            task.mark_failed(str(e))
-            logger.error(f"任务执行失败: {task.title} - {e}")
-            await self._send_feishu_text(chat_id, f"❌ 任务 [{task.title}] 失败: {str(e)[:100]}")
+            logger.error(f"工作流执行失败: {e}")
+            await self._send_feishu_text(chat_id, f"⚠️ 执行过程中出现问题: {str(e)[:200]}")
+
+        # 5. 标记失败的任务
+        for task in plan.tasks:
+            if task.status == TaskStatus.RUNNING:
+                task.mark_failed("执行未完成")
+
+        # 6. 汇总报告
+        plan.status = "completed"
+        plan.completed_at = datetime.now()
+
+        # 7. 归档项目记忆到三层记忆系统
+        await self._archive_project_memory(chat_id, plan)
+
+        # 8. 清理持久化的 active_plan
+        await self._clear_active_plan(chat_id)
+
+        await self._send_completion_report(chat_id, plan)
 
     # ========== 进度查询 ==========
 
@@ -667,12 +674,23 @@ assigned_to 可选值：developer, frontend_expert, devops, finance"""
         import os
 
         project_files = []
+        base_real = os.path.realpath(self.base_dir)
 
         try:
             # 遍历 /root/ 下的所有目录
             for item in os.listdir(self.base_dir):
                 item_path = os.path.join(self.base_dir, item)
                 if not os.path.isdir(item_path):
+                    continue
+
+                # 安全检查：跳过符号链接，防止跟随到 base_dir 之外
+                if os.path.islink(item_path):
+                    logger.warning(f"[Security] 跳过符号链接: {item_path}")
+                    continue
+
+                # 安全检查：验证真实路径未逃逸 base_dir
+                if not os.path.realpath(item_path).startswith(base_real + os.sep):
+                    logger.warning(f"[Security] 跳过 base_dir 外的路径: {item_path}")
                     continue
 
                 # 跳过隐藏目录和系统目录
@@ -762,6 +780,91 @@ assigned_to 可选值：developer, frontend_expert, devops, finance"""
                 await self.feishu.send_text(chat_id, text)
         except Exception as e:
             logger.error(f"飞书发送失败: {e}")
+
+    # ========== Active Plan 持久化（Redis + 内存 fallback）==========
+
+    async def _save_active_plan(self, chat_id: str, plan: ProjectPlan) -> None:
+        """持久化 active_plan 到 Redis，内存始终保留作为 fallback"""
+        try:
+            if self.state_manager:
+                await self.state_manager.set(
+                    f"ceo:active_plan:{chat_id}",
+                    plan.to_dict(),
+                    expire=86400 * 30,  # 30 天
+                )
+        except Exception as e:
+            logger.warning(f"Redis 存储 active_plan 失败，仅保留内存: {e}")
+
+    async def _load_active_plan(self, chat_id: str) -> Optional[ProjectPlan]:
+        """从 Redis 恢复 active_plan（内存优先，Redis 兜底）"""
+        if chat_id in self._active_plans:
+            return self._active_plans[chat_id]
+
+        try:
+            if self.state_manager:
+                data = await self.state_manager.get(f"ceo:active_plan:{chat_id}")
+                if data:
+                    plan = ProjectPlan.from_dict(data)
+                    self._active_plans[chat_id] = plan
+                    return plan
+        except Exception as e:
+            logger.warning(f"Redis 读取 active_plan 失败: {e}")
+        return None
+
+    async def _clear_active_plan(self, chat_id: str) -> None:
+        """清理持久化的 active_plan"""
+        self._active_plans.pop(chat_id, None)
+        try:
+            if self.state_manager:
+                await self.state_manager.delete(f"ceo:active_plan:{chat_id}")
+        except Exception as e:
+            logger.warning(f"Redis 删除 active_plan 失败: {e}")
+
+    # ========== 项目记忆归档 ==========
+
+    async def _archive_project_memory(self, chat_id: str, plan: ProjectPlan) -> None:
+        """
+        项目完成后归档记忆到三层记忆系统
+
+        - Layer 2 (SessionMemory): 项目元数据、任务列表
+        - Layer 3 (KnowledgeMemory): 经验总结
+        """
+        if not self.memory_manager:
+            return
+
+        # 归档项目到 SessionMemory
+        try:
+            # 存储项目级别的需求
+            await self.remember(
+                content=f"[项目需求] {plan.requirement}",
+                memory_type="task",
+                metadata={
+                    "plan_id": plan.id,
+                    "chat_id": chat_id,
+                    "task_count": len(plan.tasks),
+                    "completed_count": sum(1 for t in plan.tasks if t.status == TaskStatus.COMPLETED),
+                    "failed_count": sum(1 for t in plan.tasks if t.status == TaskStatus.FAILED),
+                    "completed_at": plan.completed_at.isoformat() if plan.completed_at else "",
+                },
+            )
+
+            # 每个任务单独存储
+            for task in plan.tasks:
+                # 如果任务已完成且有结果，将经验沉淀到 KnowledgeMemory
+                if task.status == TaskStatus.COMPLETED and task.result:
+                    await self.remember(
+                        content=f"[{task.assigned_to}] {task.title}: {task.result[:500]}",
+                        memory_type="experience",
+                        metadata={
+                            "plan_id": plan.id,
+                            "task_id": task.id,
+                            "task_title": task.title,
+                            "assigned_to": task.assigned_to,
+                        },
+                    )
+
+        except Exception as e:
+            logger.error(f"项目记忆归档失败: {e}")
 
     # ========== BaseAgent 接口实现 ==========
 

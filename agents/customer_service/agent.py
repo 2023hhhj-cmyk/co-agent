@@ -100,17 +100,23 @@ class CustomerServiceAgent(BaseAgent):
         redis_client: Any = None,
         cs_queue: Optional[CSMessageQueue] = None,
         feishu_client: Any = None,
+        memory_manager: Any = None,
+        input_guard: Any = None,
+        **kwargs,
     ):
         super().__init__(
             role=CS_ROLE,
             llm_client=llm_client,
             message_bus=message_bus,
+            memory_manager=memory_manager,
+            **kwargs,
         )
         self.wecom = wecom_client
         self.db = db
         self.redis = redis_client
         self.cs_queue = cs_queue
         self.feishu = feishu_client  # 用于转人工通知老板
+        self.input_guard = input_guard  # 输入校验器
 
         # 加载知识文件和人格文件
         self.product_doc = self._load_markdown("product.md")
@@ -142,6 +148,19 @@ class CustomerServiceAgent(BaseAgent):
         response_url = message.metadata.get("response_url", "")  # 智能机器人的回复 URL
 
         logger.info(f"客服 Agent 收到消息: customer={customer_id}, text={text[:50]}...")
+
+        # 输入安全校验
+        if self.input_guard:
+            result = self.input_guard.validate(text, source="wecom_cs")
+            if not result.allowed:
+                logger.warning(f"[InputGuard] 客服消息被拒绝: {result.reason}")
+                await self._send_reply(customer_id, "抱歉，您的消息无法处理。")
+                if self.audit_logger:
+                    await self.audit_logger.log_input_rejected(
+                        text, "wecom_cs", result.reason, result.flags, self.agent_id,
+                    )
+                return
+            text = result.content
 
         try:
             # 1. 加载会话上下文
@@ -176,7 +195,10 @@ class CustomerServiceAgent(BaseAgent):
             # 5. 更新会话历史
             await self._save_session(session, text, answer)
 
-            # 6. 撤回排队提示（如果有）
+            # 6. 归档对话到三层记忆系统
+            await self._archive_conversation(customer_id, session.customer_name, text, answer)
+
+            # 7. 撤回排队提示（如果有）
             if self.cs_queue:
                 notify_msg_id = await self.cs_queue.get_and_clear_notify_msg_id(customer_id)
                 if notify_msg_id and self.wecom:
@@ -400,7 +422,7 @@ class CustomerServiceAgent(BaseAgent):
     # ========== 公司 FAQ ==========
 
     async def _handle_company_faq(self, text: str) -> str:
-        """回答公司通用问题（数据来源：FAQ 表 + product.md）"""
+        """回答公司通用问题（数据来源：KnowledgeMemory 语义检索 + FAQ 表 + product.md）"""
         if not self.llm:
             return "抱歉，这个问题我需要确认一下，稍后让老板回复您。"
 
@@ -414,7 +436,21 @@ class CustomerServiceAgent(BaseAgent):
             if self.product_doc:
                 system_parts.append(f"\n## 公司和产品信息\n{self.product_doc}")
 
-            # 尝试从 FAQ 表获取答案
+            # 优先从 KnowledgeMemory 语义检索 FAQ
+            knowledge_context = ""
+            if self.memory_manager:
+                try:
+                    knowledge_context = await self.get_context(
+                        query=text,
+                        strategy="semantic",
+                        max_tokens_estimate=1000,
+                    )
+                    if knowledge_context and "无相关记忆" not in knowledge_context:
+                        system_parts.append(f"\n## 知识库检索结果\n{knowledge_context}")
+                except Exception as e:
+                    logger.warning(f"KnowledgeMemory 检索失败: {e}")
+
+            # 回退：从 FAQ 表获取答案
             if self.db:
                 faqs = await self.db.fetch(
                     "SELECT question, answer FROM cs_faq ORDER BY id"
@@ -589,7 +625,44 @@ class CustomerServiceAgent(BaseAgent):
             except Exception as e:
                 logger.warning(f"保存对话到 PostgreSQL 失败: {e}")
 
+    # ========== 记忆系统集成 ==========
+
+    async def _archive_conversation(
+        self, customer_id: str, customer_name: str, customer_msg: str, agent_reply: str
+    ) -> None:
+        """
+        归档对话到三层记忆系统（增量接入，不破坏现有会话存储）
+        """
+        if not self.memory_manager:
+            return
+
+        try:
+            # 存储到 SessionMemory（Layer 2）
+            await self.remember(
+                content=f"客户 {customer_name or customer_id}: {customer_msg}\n客服: {agent_reply}",
+                memory_type="chat",
+                metadata={
+                    "customer_id": customer_id,
+                    "customer_name": customer_name,
+                    "chat_id": f"cs_{customer_id}",
+                    "messages": [
+                        {"role": "customer", "content": customer_msg},
+                        {"role": "agent", "content": agent_reply},
+                    ],
+                },
+            )
+        except Exception as e:
+            logger.warning(f"归档对话到记忆系统失败: {e}")
+
     # ========== product.md 读取 ==========
+
+    def _safe_path(self, base_dir: str, relative: str) -> str:
+        """验证路径在 base_dir 内，防止路径遍历攻击"""
+        resolved = os.path.realpath(os.path.join(base_dir, relative))
+        base_real = os.path.realpath(base_dir)
+        if not resolved.startswith(base_real + os.sep):
+            raise ValueError(f"[Security] 路径遍历被阻止: {relative}")
+        return resolved
 
     async def _load_product_doc(self, customer_name: str, customer_id: str) -> str:
         """
@@ -601,15 +674,18 @@ class CustomerServiceAgent(BaseAgent):
         """
         # 直接用客户名查找
         if customer_name:
-            path = f"/root/{customer_name}/product.md"
-            if os.path.exists(path):
-                try:
-                    with open(path, "r", encoding="utf-8") as f:
-                        content = f.read()
-                    logger.info(f"已加载 product.md: {path}")
-                    return content
-                except Exception as e:
-                    logger.error(f"读取 product.md 失败: {path}, error={e}")
+            try:
+                path = self._safe_path("/root", f"{customer_name}/product.md")
+                if os.path.exists(path):
+                    try:
+                        with open(path, "r", encoding="utf-8") as f:
+                            content = f.read()
+                        logger.info(f"已加载 product.md: {path}")
+                        return content
+                    except Exception as e:
+                        logger.error(f"读取 product.md 失败: {path}, error={e}")
+            except ValueError as e:
+                logger.warning(str(e))
 
         # 从数据库查询项目路径
         if self.db:
@@ -621,13 +697,17 @@ class CustomerServiceAgent(BaseAgent):
                     customer_id,
                 )
                 for p in projects:
-                    path = f"/root/{p['name']}/product.md"
-                    if os.path.exists(path):
-                        try:
-                            with open(path, "r", encoding="utf-8") as f:
-                                return f.read()
-                        except Exception as e:
-                            logger.error(f"读取 product.md 失败: {path}, error={e}")
+                    try:
+                        path = self._safe_path("/root", f"{p['name']}/product.md")
+                        if os.path.exists(path):
+                            try:
+                                with open(path, "r", encoding="utf-8") as f:
+                                    return f.read()
+                            except Exception as e:
+                                logger.error(f"读取 product.md 失败: {path}, error={e}")
+                    except ValueError as e:
+                        logger.warning(str(e))
+                        continue
             except Exception as e:
                 logger.warning(f"查询项目路径失败: {e}")
 

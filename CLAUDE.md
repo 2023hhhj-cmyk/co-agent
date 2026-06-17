@@ -10,7 +10,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## 服务器与部署
 
-- SSH连接：`ssh muzhu-ai`（配置在 `~/.ssh/config`，root@47.82.5.164，密码认证）
+- SSH连接：`ssh muzhu-ai`（配置在 `~/.ssh/config`，详见桌面 muzhu-secrets.txt）
 - 服务器项目目录：`/root/muzhu-ai/`
 - 部署：`./scripts/deploy.sh`（rsync 同步 + 远程安装依赖 + 初始化数据库）
 - 服务器启动：`cd /root/muzhu-ai && ./start.sh`

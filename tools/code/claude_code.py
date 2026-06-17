@@ -9,7 +9,7 @@ import asyncio
 import logging
 import os
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +38,7 @@ class ClaudeCodeTool:
         base_dir: str = "/root",
         timeout: int = 600,
         allowed_tools: Optional[list[str]] = None,
+        sandbox: Any = None,
     ):
         """
         初始化 ClaudeCodeTool
@@ -46,9 +47,11 @@ class ClaudeCodeTool:
             base_dir: 基础目录，客户项目将创建在此目录下
             timeout: 命令超时时间（秒），默认 600 秒（10 分钟）
             allowed_tools: 允许使用的工具列表，None 表示使用默认工具
+            sandbox: SandboxedExecutor 实例，提供则使用沙箱执行
         """
         self.base_dir = base_dir
         self.timeout = timeout
+        self.sandbox = sandbox
         self.allowed_tools = allowed_tools or [
             "Read",
             "Write",
@@ -93,6 +96,17 @@ class ClaudeCodeTool:
             ClaudeCodeResult: 执行结果
         """
         cwd = working_dir or self.base_dir
+
+        # 沙箱模式（优先）
+        if self.sandbox:
+            logger.info(f"使用沙箱执行: mode={self.sandbox.mode}")
+            sandbox_result = await self.sandbox.execute(task, context, cwd)
+            return ClaudeCodeResult(
+                success=sandbox_result.success,
+                output=sandbox_result.output,
+                error=sandbox_result.error,
+                working_dir=cwd,
+            )
 
         # 确保工作目录存在
         os.makedirs(cwd, exist_ok=True)

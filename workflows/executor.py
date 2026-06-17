@@ -76,7 +76,22 @@ class AgentNodeExecutor(NodeExecutor):
             raise ValueError(f"Agent not found for role: {role}")
 
         agent = self.agents[role]
-        result = await agent.run(input_message)
+
+        # 优先使用 CEO 拆解的任务描述（动态 DAG 场景）
+        task_desc = context.get("task_descriptions", {}).get(node_id)
+        if task_desc:
+            task_metadata = context.get("task_metadata", {}).get(node_id, {})
+            message = Message(
+                content=task_desc,
+                cause_by="ceo_task_assignment",
+                sent_from="ceo",
+                send_to={role},
+                metadata=task_metadata,
+            )
+        else:
+            message = input_message
+
+        result = await agent.run(message)
 
         if result is None:
             # Agent 没有输出，创建一个默认消息
@@ -120,9 +135,11 @@ class WorkflowExecutor:
         self,
         graph: WorkflowGraph,
         agents: Optional[Dict[str, Any]] = None,
+        on_progress: Any = None,
     ):
         self.graph = graph
         self.agents = agents or {}
+        self.on_progress = on_progress  # 进度回调：async def on_progress(node_id, result)
 
         # 注册默认执行器
         self.executors: Dict[str, NodeExecutor] = {
@@ -138,6 +155,7 @@ class WorkflowExecutor:
         self,
         input_message: Message,
         max_parallel: int = 5,
+        extra_context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         执行工作流
@@ -145,6 +163,7 @@ class WorkflowExecutor:
         Args:
             input_message: 输入消息
             max_parallel: 最大并行数
+            extra_context: 额外上下文（如 CEO 拆解的任务描述和元数据）
 
         Returns:
             执行上下文（包含所有节点的输出）
@@ -160,6 +179,10 @@ class WorkflowExecutor:
             "input": input_message.to_dict(),
             "outputs": {},  # node_id -> output message
         }
+
+        # 合并额外上下文（CEO 拆解的任务描述等）
+        if extra_context:
+            context.update(extra_context)
 
         # 按层执行
         for layer_idx, layer in enumerate(layers):
@@ -188,6 +211,13 @@ class WorkflowExecutor:
                     context["outputs"][node_id] = result.to_dict()
                     # 更新输入消息为当前节点的输出（供下一层使用）
                     input_message = result
+
+                    # 进度回调
+                    if self.on_progress:
+                        try:
+                            await self.on_progress(node_id, result)
+                        except Exception as e:
+                            logger.warning(f"Progress callback failed for {node_id}: {e}")
 
             logger.info(f"Layer {layer_idx} completed")
 

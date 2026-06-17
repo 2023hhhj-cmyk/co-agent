@@ -52,11 +52,12 @@ FINANCE_ROLE = AgentRole(
 class FinanceAgent(BaseAgent):
     """财务人员 Agent"""
 
-    def __init__(self, llm_client: Optional[LLMClient] = None, message_bus: Any = None):
+    def __init__(self, llm_client: Optional[LLMClient] = None, message_bus: Any = None, **kwargs):
         super().__init__(
             role=FINANCE_ROLE,
             llm_client=llm_client,
             message_bus=message_bus,
+            **kwargs,
         )
 
     async def _think(self, messages: list[Message]) -> Optional[ActionDef]:

@@ -6,6 +6,7 @@ Agent 基类 - 融合 MetaGPT 角色机制
 - watch 订阅机制：只处理关心的消息
 - cause_by 标记：消息来源追踪
 - 反应模式：REACT / BY_ORDER / PLAN_AND_ACT
+- 三层记忆系统：WorkingMemory + SessionMemory + KnowledgeMemory
 """
 
 import asyncio
@@ -13,12 +14,24 @@ import logging
 import uuid
 from abc import ABC, abstractmethod
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
 from models.agent import ActionDef, AgentRole, ReactMode
 from models.message import Message, MessageQueue
+from observability.metrics import (
+    agent_state as agent_state_metric,
+    task_duration as task_duration_metric,
+    task_total,
+    messages_processed,
+)
 from tools.llm.client import LLMClient
 from tools.llm.prompt import PromptManager
+
+if TYPE_CHECKING:
+    from memory.manager import MemoryManager
+    from memory.working import WorkingMemory
+    from security.access_control import PolicyEnforcer
+    from security.audit import AuditLogger
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +52,9 @@ class BaseAgent(ABC):
         role: AgentRole,
         llm_client: Optional[LLMClient] = None,
         message_bus: Any = None,
+        memory_manager: Optional["MemoryManager"] = None,
+        policy_enforcer: Any = None,
+        audit_logger: Any = None,
     ):
         # 基础属性
         self.agent_id = str(uuid.uuid4())
@@ -53,8 +69,19 @@ class BaseAgent(ABC):
 
         # 消息和记忆
         self.message_queue: MessageQueue = MessageQueue()
-        self.memory: List[Message] = []  # 工作记忆
-        self.working_memory: List[Message] = []  # 当前任务记忆
+        self.memory: List[Message] = []  # 工作记忆（向后兼容）
+
+        # 三层记忆系统
+        self.memory_manager: Optional["MemoryManager"] = memory_manager
+        self._working_memory = None  # 懒初始化，由 memory_manager.get_working() 提供
+
+        # 注入 LLM 客户端给 MemoryManager（用于自动提炼）
+        if memory_manager and llm_client:
+            memory_manager.set_llm_client(llm_client)
+
+        # 安全模块
+        self.policy_enforcer = policy_enforcer
+        self.audit_logger = audit_logger
 
         # 动作状态
         self.todo: ActionDef | None = None
@@ -78,6 +105,13 @@ class BaseAgent(ABC):
             and self.todo is None
             and self.message_queue.is_empty()
         )
+
+    @property
+    def working_memory(self):
+        """当前任务工作记忆（懒初始化，由 MemoryManager 管理）"""
+        if self._working_memory is None and self.memory_manager:
+            self._working_memory = self.memory_manager.get_working(self.agent_id)
+        return self._working_memory
 
     # ========== MetaGPT 三阶段循环 ==========
 
@@ -110,6 +144,9 @@ class BaseAgent(ABC):
         # 添加到记忆
         for msg in messages:
             self.memory.append(msg)
+            # 同时写入三层记忆系统的短期工作区
+            if self.working_memory is not None:
+                self.working_memory.add(msg)
 
         return messages
 
@@ -190,8 +227,9 @@ class BaseAgent(ABC):
         流程：
         1. 如果有输入消息，加入队列
         2. 执行 _observe() 获取消息
-        3. 如果有消息，根据 react_mode 执行
-        4. 返回结果
+        3. 主动检索相关记忆，注入消息流
+        4. 如果有消息，根据 react_mode 执行
+        5. 返回结果
         """
         # 注入输入消息
         if message:
@@ -202,8 +240,35 @@ class BaseAgent(ABC):
         if not messages:
             return None
 
-        # 更新状态
+        # 主动检索相关记忆（P1: Proactive Recall）
+        messages = await self._inject_memory_context(messages)
+
+        # 权限检查：验证 Agent 是否有权处理此类消息
+        if self.policy_enforcer:
+            for msg in messages:
+                if msg.cause_by and msg.cause_by != "memory_context":
+                    if not self.policy_enforcer.can_watch(self.role.name, {msg.cause_by}):
+                        logger.warning(f"[AccessControl] {self.name} 无权处理 {msg.cause_by}")
+                        if self.audit_logger:
+                            await self.audit_logger.log_auth_failure(
+                                self.agent_id, msg.cause_by,
+                                f"Agent {self.name} 无权处理该消息类型",
+                            )
+                        return None
+
+        # 更新状态 + 指标
         self.state = "busy"
+        agent_state_metric.labels(agent=self.name, role=self.role.name).set(1)
+
+        # 消息处理计数
+        for msg in messages:
+            if msg.cause_by and msg.cause_by != "memory_context":
+                messages_processed.labels(
+                    agent=self.name, cause_by=msg.cause_by
+                ).inc()
+
+        import time
+        task_start = time.time()
         try:
             # 根据反应模式执行
             if self.role.react_mode == ReactMode.REACT:
@@ -224,10 +289,38 @@ class BaseAgent(ABC):
         except Exception as e:
             logger.error(f"Agent {self.name} error: {e}")
             self.state = "error"
+            agent_state_metric.labels(agent=self.name, role=self.role.name).set(2)
+            task_total.labels(agent=self.name, status="error").inc()
+            if self.audit_logger:
+                await self.audit_logger.log_task_executed(
+                    self.agent_id, str(e)[:200], result="error", duration_ms=0,
+                )
             raise
         finally:
+            elapsed = time.time() - task_start
             self.state = "idle"
             self.todo = None
+            agent_state_metric.labels(agent=self.name, role=self.role.name).set(0)
+            task_duration_metric.labels(agent=self.name).observe(elapsed)
+            task_total.labels(agent=self.name, status="success").inc()
+            # 审计日志：任务执行
+            if self.audit_logger and result:
+                await self.audit_logger.log_task_executed(
+                    self.agent_id,
+                    result.content[:200] if result.content else "",
+                    result="success",
+                )
+            # 自动归档短期记忆到中期记忆
+            if self.memory_manager and self.working_memory and not self.working_memory.is_empty:
+                try:
+                    await self.memory_manager.archive_working_memory(
+                        agent_id=self.agent_id,
+                        agent_role=self.role.name,
+                        working_memory=self.working_memory,
+                    )
+                    self.working_memory.clear()
+                except Exception as e:
+                    logger.warning(f"归档工作记忆失败: {e}")
 
     async def _plan_and_act(self, messages: List[Message]) -> Optional[Message]:
         """
@@ -264,6 +357,142 @@ class BaseAgent(ABC):
         借鉴 MetaGPT 的 put_message
         """
         asyncio.create_task(self.message_queue.push(message))
+
+    # ========== 记忆系统 API ==========
+
+    async def recall(
+        self,
+        query: str,
+        strategy: str = "default",
+        top_k: int = 10,
+    ) -> List[Any]:
+        """
+        检索相关记忆（三层融合）
+
+        Args:
+            query: 查询文本
+            strategy: 检索策略 — "default" | "recent" | "semantic" | "comprehensive"
+            top_k: 每层最大返回数
+
+        Returns:
+            List[MemoryItem]
+        """
+        if not self.memory_manager:
+            return []
+        return await self.memory_manager.recall(
+            query=query,
+            agent_id=self.agent_id,
+            agent_role=self.role.name,
+            strategy=strategy,
+            top_k=top_k,
+        )
+
+    async def remember(
+        self,
+        content: str,
+        memory_type: str = "task",
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Optional[str]:
+        """
+        存储新记忆
+
+        Args:
+            content: 记忆内容
+            memory_type: 类型 — "task" | "chat" | "experience" | "faq" | "best_practice"
+            metadata: 额外元数据
+
+        Returns:
+            memory_id
+        """
+        if not self.memory_manager:
+            return None
+        return await self.memory_manager.remember(
+            content=content,
+            agent_id=self.agent_id,
+            agent_role=self.role.name,
+            memory_type=memory_type,
+            metadata=metadata,
+        )
+
+    async def get_context(
+        self,
+        query: str,
+        strategy: str = "default",
+        max_tokens_estimate: int = 2000,
+    ) -> str:
+        """
+        获取完整上下文文本（用于注入 LLM prompt）
+
+        Args:
+            query: 当前查询
+            strategy: 检索策略
+            max_tokens_estimate: 最大估计 token 数
+
+        Returns:
+            格式化的上下文文本
+        """
+        if not self.memory_manager:
+            return ""
+        return await self.memory_manager.get_context(
+            query=query,
+            agent_id=self.agent_id,
+            agent_role=self.role.name,
+            strategy=strategy,
+            max_tokens_estimate=max_tokens_estimate,
+        )
+
+    # ========== 主动检索（P1: Proactive Recall）==========
+
+    async def _inject_memory_context(self, messages: List[Message]) -> List[Message]:
+        """
+        在 Think 之前，自动检索相关记忆并注入消息流
+
+        以最后一条消息内容作为查询，从三层记忆系统检索相关上下文，
+        作为 memory_context 消息插入，供 _think() 使用。
+
+        Args:
+            messages: _observe() 返回的消息列表
+
+        Returns:
+            增强后的消息列表（含记忆上下文）
+        """
+        if not self.memory_manager or not messages:
+            return messages
+
+        try:
+            # 以最后一条消息内容作为查询
+            query = messages[-1].content if messages[-1].content else ""
+            if not query or len(query) < 3:
+                return messages
+
+            # 检索相关上下文（限定 500 token 估算）
+            context = await self.memory_manager.get_context(
+                query=query,
+                agent_id=self.agent_id,
+                agent_role=self.role.name,
+                strategy="default",
+                max_tokens_estimate=500,
+            )
+
+            # 如果有相关记忆，注入消息流
+            if context and "无相关记忆" not in context:
+                memory_msg = Message(
+                    content=context,
+                    cause_by="memory_context",
+                    sent_from="memory_system",
+                    send_to={self.agent_id},
+                )
+                # 插入到最后一条消息之前（让 Agent 看到记忆后再看最新消息）
+                messages.insert(-1, memory_msg)
+                logger.debug(
+                    f"Agent {self.name}: 注入记忆上下文 ({len(context)} chars)"
+                )
+
+        except Exception as e:
+            # 主动检索失败不影响主流程
+            logger.warning(f"Agent {self.name} 主动检索记忆失败: {e}")
+
+        return messages
 
     # ========== 辅助方法 ==========
 

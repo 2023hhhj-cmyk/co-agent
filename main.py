@@ -13,9 +13,12 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 import uvicorn
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import PlainTextResponse, JSONResponse
+from slowapi import Limiter
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
 
 from agents import (
     CEOAgent,
@@ -30,19 +33,27 @@ from channels.wecom import WecomClient
 from communication.message_bus import MessageBus
 from communication.queue import CSMessageQueue, QueueWorker, QueuedMessage
 from config.settings import settings
+from acceleration import ResponseCache, EmbeddingCache, PromptOptimizer
+from memory import MemoryGraph, MemoryManager, SessionMemory, KnowledgeMemory
 from models.message import Message
+from observability import (
+    setup_logging,
+    generate_trace_id,
+    HealthChecker,
+    http_requests,
+    http_request_duration,
+    get_metrics,
+    agent_state,
+    sandbox_mode as sandbox_metric,
+    queue_depth as queue_metric,
+)
+from security import InputGuard, SandboxedExecutor, PolicyEnforcer, AuditLogger
 from storage.database import Database
 from storage.state_manager import StateManager
 from tools.llm.router import LLMRouter
-from workflows.executor import WorkflowExecutor
-from workflows.graph import WorkflowGraph
-from workflows.loader import WorkflowLoader
 
-# 配置日志
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-)
+# 初始化结构化日志 (JSON + trace_id)
+setup_logging(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # ========== 全局组件 ==========
@@ -56,6 +67,24 @@ llm_router = LLMRouter()
 # 存储
 state_manager = StateManager()
 database = Database()
+
+# 记忆系统（三层架构：WorkingMemory + SessionMemory + KnowledgeMemory）
+session_memory: SessionMemory = None
+knowledge_memory: KnowledgeMemory = None
+memory_manager: MemoryManager = None
+
+# 安全系统
+input_guard: InputGuard = None
+sandbox: SandboxedExecutor = None
+policy_enforcer: PolicyEnforcer = None
+audit_logger: AuditLogger = None
+
+# 可观测性
+health_checker: HealthChecker = None
+
+# 加速层
+llm_cache: ResponseCache = None
+embed_cache: EmbeddingCache = None
 
 # 飞书客户端
 feishu_client = FeishuClient()
@@ -81,37 +110,54 @@ agents = {}
 
 
 def create_agents():
-    """创建所有 Agent"""
+    """创建所有 Agent（注入 MemoryManager）"""
     global agents
 
-    # 先创建下级 Agent
+    # 先创建下级 Agent（注入安全模块）
     devops_agent = DevOpsAgent(
         llm_client=llm_router.get_client_by_agent("devops"),
         message_bus=message_bus,
+        memory_manager=memory_manager,
+        policy_enforcer=policy_enforcer,
+        audit_logger=audit_logger,
     )
 
     agents = {
         "developer": DeveloperAgent(
             llm_client=llm_router.get_client_by_agent("developer"),
             message_bus=message_bus,
+            memory_manager=memory_manager,
+            policy_enforcer=policy_enforcer,
+            audit_logger=audit_logger,
         ),
         "frontend_expert": FrontendExpertAgent(
             llm_client=llm_router.get_client_by_agent("frontend_expert"),
             message_bus=message_bus,
+            memory_manager=memory_manager,
+            policy_enforcer=policy_enforcer,
+            audit_logger=audit_logger,
         ),
         "devops": devops_agent,
         "finance": FinanceAgent(
             llm_client=llm_router.get_client_by_agent("finance"),
             message_bus=message_bus,
+            memory_manager=memory_manager,
+            policy_enforcer=policy_enforcer,
+            audit_logger=audit_logger,
         ),
     }
 
-    # CEO 最后创建，注入飞书客户端和团队
+    # CEO 最后创建，注入飞书客户端、团队、状态管理器和输入校验
     agents["ceo"] = CEOAgent(
         llm_client=llm_router.get_client_by_agent("ceo"),
         message_bus=message_bus,
         feishu_client=feishu_client,
         team=agents,
+        memory_manager=memory_manager,
+        state_manager=state_manager,
+        input_guard=input_guard,
+        policy_enforcer=policy_enforcer,
+        audit_logger=audit_logger,
     )
 
     # 设置 DevOps Agent 的飞书客户端（用于告警通知）
@@ -119,20 +165,6 @@ def create_agents():
     devops_agent._feishu_client = feishu_client
 
     return agents
-
-
-def load_workflow():
-    """加载工作流定义"""
-    workflow_path = Path(__file__).parent / "workflows" / "yaml" / "requirement_flow.yaml"
-    if workflow_path.exists():
-        loader = WorkflowLoader()
-        workflow_def = loader.load(workflow_path)
-        graph = WorkflowGraph(workflow_def.graph)
-        logger.info(f"Workflow loaded: {graph.id}")
-        return graph
-    else:
-        logger.warning(f"Workflow file not found: {workflow_path}")
-        return None
 
 
 # ========== 生命周期管理 ==========
@@ -146,16 +178,62 @@ async def lifespan(app: FastAPI):
     await state_manager.connect()
     await database.connect()
 
+    # 初始化安全系统
+    global input_guard, sandbox, policy_enforcer, audit_logger
+    input_guard = InputGuard()
+    sandbox = SandboxedExecutor(base_dir="/root")
+    policy_enforcer = PolicyEnforcer()
+    audit_logger = AuditLogger(database=database)
+    logger.info(
+        f"安全系统初始化完成: "
+        f"InputGuard + Sandbox({sandbox.mode}) + PolicyEnforcer + AuditLogger"
+    )
+
+    # 初始化可观测性
+    global health_checker
+    health_checker = HealthChecker(
+        state_manager=state_manager,
+        database=database,
+        chromadb_url=settings.CHROMADB_URL,
+        agents=agents,
+    )
+    # 设置初始沙箱模式指标
+    sandbox_metric.set(1 if sandbox.mode == "docker" else 0)
+    logger.info("可观测性系统初始化完成")
+
+    # 初始化加速层
+    global llm_cache, embed_cache
+    llm_cache = ResponseCache(state_manager=state_manager)
+    embed_cache = EmbeddingCache(state_manager=state_manager)
+
+    # 注入缓存到 LLM Router 的所有客户端
+    for client in [llm_router.get_client_by_agent("ceo"),
+                   llm_router.get_client_by_agent("developer"),
+                   llm_router.get_client_by_agent("customer_service")]:
+        if client:
+            client.set_cache(llm_cache)
+    logger.info("加速层初始化完成 (LLM缓存 + 嵌入缓存)")
+
+    # 初始化三层记忆系统
+    global session_memory, knowledge_memory, memory_manager
+    session_memory = SessionMemory(state_manager=state_manager, database=database)
+    try:
+        knowledge_memory = KnowledgeMemory(embedding_cache=embed_cache)
+        logger.info("KnowledgeMemory (ChromaDB) 初始化成功")
+    except Exception as e:
+        logger.warning(f"KnowledgeMemory 初始化失败，语义检索不可用: {e}")
+        knowledge_memory = None
+    memory_graph = MemoryGraph(state_manager=state_manager, database=database)
+    memory_manager = MemoryManager(
+        session_memory=session_memory,
+        knowledge_memory=knowledge_memory,
+        graph=memory_graph,
+    )
+    logger.info("三层记忆系统 + 关联图谱初始化完成")
+
     # 创建 Agent
     create_agents()
     logger.info(f"Agents created: {list(agents.keys())}")
-
-    # 加载工作流
-    graph = load_workflow()
-    if graph:
-        app.state.workflow_graph = graph
-        app.state.workflow_executor = WorkflowExecutor(graph, agents)
-        logger.info("Workflow engine initialized")
 
     # 启动飞书 WebSocket 长连接
     async def handle_feishu_message(parsed: dict):
@@ -172,6 +250,34 @@ async def lifespan(app: FastAPI):
         )
 
     feishu_client.set_message_handler(handle_feishu_message)
+
+    # 卡片按钮回调处理
+    def handle_feishu_card(data: dict):
+        """处理飞书卡片按钮回调（通过 WebSocket）"""
+        ceo = agents.get("ceo")
+        if not ceo:
+            return
+
+        action = data.get("action", {})
+        value = action.get("value", {})
+        open_id = data.get("open_id", "")
+        chat_id = data.get("open_chat_id", "")
+
+        if value and chat_id:
+            # 生成唯一 message_id，避免被去重跳过
+            card_msg_id = f"card_{value.get('action', '')}_{value.get('plan_id', '')}_{int(asyncio.get_event_loop().time())}"
+            logger.info(f"卡片回调转发给 CEO: action={value.get('action')}")
+            asyncio.run_coroutine_threadsafe(
+                ceo.handle_feishu_message(
+                    chat_id=chat_id,
+                    text=json.dumps(value),
+                    message_id=card_msg_id,
+                    sender_id=open_id,
+                ),
+                asyncio.get_event_loop(),
+            )
+
+    feishu_client.set_card_handler(handle_feishu_card)
     feishu_client.start_ws(loop=asyncio.get_event_loop())
     logger.info("飞书 WebSocket 长连接已启动")
 
@@ -185,6 +291,10 @@ async def lifespan(app: FastAPI):
         redis_client=state_manager.redis,
         cs_queue=cs_queue,
         feishu_client=feishu_client,
+        memory_manager=memory_manager,
+        input_guard=input_guard,
+        policy_enforcer=policy_enforcer,
+        audit_logger=audit_logger,
     )
     agents["customer_service"] = cs_agent
 
@@ -222,11 +332,93 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=settings.CORS_ORIGINS,
+    allow_credentials=False,
+    allow_methods=["GET", "POST"],
+    allow_headers=["Content-Type", "Authorization", "X-API-Key"],
 )
+
+# 速率限制器
+limiter = Limiter(key_func=get_remote_address, default_limits=[settings.RATE_LIMIT])
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, lambda request, exc: JSONResponse(
+    status_code=429,
+    content={"error": "Rate limit exceeded"},
+))
+
+
+# HTTP 指标中间件
+@app.middleware("http")
+async def metrics_middleware(request: Request, call_next):
+    """追踪 HTTP 请求指标 + trace_id"""
+    import time
+    # 生成 trace_id
+    tid = generate_trace_id()
+    start = time.time()
+
+    response = await call_next(request)
+
+    duration = time.time() - start
+
+    # 记录 HTTP 指标
+    http_requests.labels(
+        method=request.method,
+        endpoint=request.url.path,
+        status=response.status_code,
+    ).inc()
+
+    http_request_duration.labels(
+        method=request.method,
+        endpoint=request.url.path,
+    ).observe(duration)
+
+    return response
+
+
+# API Key 认证中间件（在 metrics 之后注册 = 先于 metrics 执行）
+@app.middleware("http")
+async def api_key_middleware(request: Request, call_next):
+    """API Key 认证中间件"""
+    # 公开路径：无需认证
+    public_paths = {"/", "/health", "/metrics"}
+    # Webhook 路径：自有签名验证
+    webhook_prefixes = {"/api/feishu/webhook", "/api/wecom/ceo/callback", "/api/wecom/cs/callback"}
+
+    if request.url.path in public_paths:
+        return await call_next(request)
+    if any(request.url.path.startswith(p) for p in webhook_prefixes):
+        return await call_next(request)
+
+    # 开发模式：未配置 API_KEY 时放行（向后兼容）
+    if not settings.API_KEY:
+        return await call_next(request)
+
+    # 验证 X-API-Key
+    api_key = request.headers.get("X-API-Key")
+    if api_key != settings.API_KEY:
+        if audit_logger:
+            await audit_logger.log_auth_failure(
+                agent_id="system",
+                action=f"{request.method} {request.url.path}",
+                reason="invalid or missing API key",
+            )
+        return JSONResponse(
+            status_code=401,
+            content={"error": "Unauthorized", "message": "Valid X-API-Key header required"},
+        )
+
+    return await call_next(request)
+
+
+# 安全 HTTP 头中间件
+@app.middleware("http")
+async def security_headers_middleware(request: Request, call_next):
+    """为所有响应添加安全 HTTP 头"""
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Strict-Transport-Security"] = "max-age=31536000"
+    return response
 
 
 # ========== API 路由 ==========
@@ -244,55 +436,56 @@ async def root():
 
 @app.get("/health")
 async def health():
-    """健康检查"""
-    return {"status": "healthy"}
+    """增强健康检查 — 验证全部依赖"""
+    if health_checker:
+        return await health_checker.check()
+    return {"status": "healthy", "note": "health_checker not initialized"}
+
+
+@app.get("/metrics")
+async def metrics():
+    """Prometheus 指标端点"""
+    from fastapi.responses import Response
+    return Response(
+        content=get_metrics(),
+        media_type="text/plain; version=0.0.4",
+    )
 
 
 @app.post("/api/requirement")
 async def create_requirement(requirement: dict):
     """
-    创建需求 - 通过工作流执行
+    创建需求 - 通过 CEO 拆解 + WorkflowExecutor 执行
 
-    流程：CEO → PM → [Dev + Design] → Deploy → Finance
+    流程：CEO 拆解任务 → 生成动态 DAG → WorkflowExecutor 分层执行
     """
     content = requirement.get("content", "")
     if not content:
         return {"error": "Content is required"}
 
-    # 创建输入消息
-    input_message = Message(
-        content=content,
-        cause_by="user_requirement",
-        sent_from="user",
-        send_to={"*"},
-    )
+    ceo = agents.get("ceo")
+    if not ceo:
+        return {"error": "CEO agent not available"}
 
-    # 检查工作流引擎是否可用
-    if hasattr(app.state, "workflow_executor"):
-        # 通过工作流执行
-        logger.info(f"Executing workflow for requirement: {content[:50]}...")
-        try:
-            result = await app.state.workflow_executor.execute(input_message)
-            return {
-                "status": "success",
-                "workflow_id": app.state.workflow_graph.id,
-                "result": result,
-            }
-        except Exception as e:
-            logger.error(f"Workflow execution failed: {e}")
-            return {"status": "error", "message": str(e)}
-    else:
-        # 回退：直接调用 CEO
-        logger.info("Workflow not available, falling back to CEO")
-        ceo = agents.get("ceo")
-        if ceo:
-            result = await ceo.run(input_message)
-            return {
-                "status": "success",
-                "result": result.to_dict() if result else None,
-            }
-        else:
-            return {"error": "CEO agent not available"}
+    logger.info(f"收到需求: {content[:50]}...")
+
+    try:
+        # CEO 拆解任务
+        plan = await ceo._decompose_tasks(content, "api", "")
+        if not plan:
+            return {"status": "error", "message": "任务拆解失败"}
+
+        # 执行（通过 WorkflowExecutor）
+        await ceo._execute_plan("api", plan)
+
+        return {
+            "status": "success",
+            "plan_id": plan.id,
+            "tasks": [t.to_summary() for t in plan.tasks],
+        }
+    except Exception as e:
+        logger.error(f"需求处理失败: {e}", exc_info=True)
+        return {"status": "error", "message": "Internal server error"}
 
 
 @app.get("/api/agents")
@@ -308,16 +501,12 @@ async def get_agents():
 
 @app.get("/api/workflow")
 async def get_workflow():
-    """获取工作流信息"""
-    if hasattr(app.state, "workflow_graph"):
-        graph = app.state.workflow_graph
-        return {
-            "id": graph.id,
-            "description": graph.description,
-            "nodes": list(graph.nodes.keys()),
-            "layers": graph.topological_sort(),
-        }
-    return {"error": "Workflow not loaded"}
+    """获取工作流信息（静态模板已废弃，现在由 CEO 动态生成 DAG）"""
+    return {
+        "status": "dynamic",
+        "description": "工作流由 CEO Agent 根据需求动态生成，不再使用静态 YAML 定义",
+        "template": "templates/project_template.yaml",
+    }
 
 
 @app.get("/api/messages/history")
@@ -406,6 +595,7 @@ async def stop_devops_service(service_name: str):
 
 
 @app.post("/api/feishu/webhook")
+@limiter.limit("120/minute")
 async def feishu_webhook(request: Request):
     """
     飞书事件回调端点
@@ -415,7 +605,29 @@ async def feishu_webhook(request: Request):
     2. 消息事件（im.message.receive_v1）
     3. 卡片回调（action）
     """
-    body = await request.json()
+    # Step 0: 验证签名
+    timestamp = request.headers.get("X-Lark-Request-Timestamp", "")
+    signature = request.headers.get("X-Lark-Signature", "")
+
+    body_bytes = await request.body()
+
+    if settings.FEISHU_VERIFICATION_TOKEN:
+        expected = FeishuClient.verify_webhook_signature(
+            timestamp, body_bytes, settings.FEISHU_VERIFICATION_TOKEN
+        )
+        if signature != expected:
+            logger.warning(f"[Security] 飞书签名验证失败")
+            if audit_logger:
+                await audit_logger.log_auth_failure(
+                    agent_id="system",
+                    action="feishu_webhook",
+                    reason="signature verification failed",
+                )
+            return JSONResponse(status_code=401, content={"error": "Invalid signature"})
+    else:
+        logger.warning("FEISHU_VERIFICATION_TOKEN 未配置，跳过签名验证（不安全）")
+
+    body = json.loads(body_bytes.decode("utf-8"))
     logger.info(f"收到飞书回调: {json.dumps(body, ensure_ascii=False)[:200]}")
 
     # 1. URL 验证请求
@@ -462,6 +674,8 @@ async def feishu_webhook(request: Request):
                         message_id=body.get("open_message_id", ""),
                     )
                 )
+        # 卡片回调返回空字典（不更新卡片）
+        return {}
 
     return {"code": 0}
 
@@ -484,8 +698,8 @@ async def wecom_ceo_verify(request: Request):
         )
         return PlainTextResponse(echostr_decrypted)
     except Exception as e:
-        logger.error(f"企业微信 CEO 回调验证失败: {e}")
-        return PlainTextResponse(str(e), status_code=403)
+        logger.error(f"企业微信 CEO 回调验证失败: {e}", exc_info=True)
+        return PlainTextResponse("Verification failed", status_code=403)
 
 
 # CEO 消息去重集合
@@ -493,6 +707,7 @@ _ceo_processed_messages: set[str] = set()
 
 
 @app.post("/api/wecom/ceo/callback")
+@limiter.limit("120/minute")
 async def wecom_ceo_callback(request: Request):
     """
     企业微信 CEO 智能机器人消息回调（POST 请求）
@@ -514,8 +729,8 @@ async def wecom_ceo_callback(request: Request):
     try:
         msg = wecom_ceo_client.decrypt_message(msg_signature, timestamp, nonce, encrypt)
     except Exception as e:
-        logger.error(f"企业微信 CEO 消息解密失败: {e}")
-        return {"error": str(e)}
+        logger.error(f"企业微信 CEO 消息解密失败: {e}", exc_info=True)
+        return {"error": "Decryption failed"}
 
     # 提取消息内容（支持 JSON 和 XML 格式）
     if isinstance(msg, dict):
@@ -579,8 +794,8 @@ async def wecom_ceo_callback(request: Request):
 
             return {"code": 0}
         except Exception as e:
-            logger.error(f"CEO 处理消息失败: {e}")
-            return {"error": str(e)}
+            logger.error(f"CEO 处理消息失败: {e}", exc_info=True)
+            return {"error": "Message processing failed"}
     else:
         logger.error("CEO Agent 未初始化")
         return {"error": "CEO Agent not available"}
@@ -604,11 +819,12 @@ async def wecom_cs_verify(request: Request):
         )
         return PlainTextResponse(echostr_decrypted)
     except Exception as e:
-        logger.error(f"企业微信客服回调验证失败: {e}")
-        return PlainTextResponse(str(e), status_code=403)
+        logger.error(f"企业微信客服回调验证失败: {e}", exc_info=True)
+        return PlainTextResponse("Verification failed", status_code=403)
 
 
 @app.post("/api/wecom/cs/callback")
+@limiter.limit("120/minute")
 async def wecom_cs_callback(request: Request):
     """
     企业微信客服应用消息回调（POST 请求）
@@ -646,8 +862,8 @@ async def wecom_cs_callback(request: Request):
     try:
         msg = wecom_cs_client.decrypt_message(msg_signature, timestamp, nonce, encrypt)
     except Exception as e:
-        logger.error(f"企业微信客服消息解密失败: {e}")
-        return {"error": str(e)}
+        logger.error(f"企业微信客服消息解密失败: {e}", exc_info=True)
+        return {"error": "Decryption failed"}
 
     # 提取消息内容（支持 XML 和 JSON 两种格式）
     logger.info(f"解密后的消息: {msg}")
@@ -711,9 +927,19 @@ async def wecom_cs_callback(request: Request):
 # ========== 主入口 ==========
 
 if __name__ == "__main__":
+    ssl_kwargs = {}
+    if settings.SSL_CERT_FILE and settings.SSL_KEY_FILE:
+        ssl_kwargs = {
+            "ssl_certfile": settings.SSL_CERT_FILE,
+            "ssl_keyfile": settings.SSL_KEY_FILE,
+        }
+    elif not settings.HOST.startswith("127.") and not settings.HOST.startswith("localhost"):
+        logger.warning("[Security] Running without TLS on non-localhost address")
+
     uvicorn.run(
         "main:app",
         host=settings.HOST,
         port=settings.PORT,
-        reload=True,
+        reload=False,  # 生产环境禁止热重载
+        **ssl_kwargs,
     )

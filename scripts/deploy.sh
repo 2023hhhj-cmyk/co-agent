@@ -13,13 +13,21 @@ echo ""
 # 排除的文件和目录
 EXCLUDE="--exclude=.git --exclude=.claude --exclude=venv --exclude=__pycache__ --exclude=.env --exclude=product.md --exclude=CLAUDE.md"
 
+# 检查 SSH 主机密钥（防止中间人攻击）
+if ! ssh-keygen -F "$SERVER" > /dev/null 2>&1; then
+    echo "ERROR: Host key for $SERVER not found in known_hosts."
+    echo "Run: ssh-keyscan -H $SERVER >> ~/.ssh/known_hosts"
+    echo "Or: ssh $SERVER once to add it interactively."
+    exit 1
+fi
+
 # 使用rsync同步文件
 echo "=== 同步文件到服务器 ==="
-rsync -avz --progress $EXCLUDE -e "ssh -o StrictHostKeyChecking=no" "$LOCAL_DIR/" "$SERVER:$REMOTE_DIR/"
+rsync -avz --progress $EXCLUDE -e "ssh" "$LOCAL_DIR/" "$SERVER:$REMOTE_DIR/"
 
 echo ""
 echo "=== 同步 Skills 到服务器 ==="
-rsync -avz --progress -e "ssh -o StrictHostKeyChecking=no" "$LOCAL_DIR/.claude/skills/" "$SERVER:$REMOTE_DIR/.claude/skills/"
+rsync -avz --progress -e "ssh" "$LOCAL_DIR/.claude/skills/" "$SERVER:$REMOTE_DIR/.claude/skills/"
 
 echo ""
 echo "=== 文件同步完成 ==="
@@ -27,7 +35,7 @@ echo "=== 文件同步完成 ==="
 # 在服务器上执行初始化
 echo ""
 echo "=== 在服务器上初始化环境 ==="
-ssh -o StrictHostKeyChecking=no "$SERVER" << 'REMOTE_SCRIPT'
+ssh "$SERVER" << 'REMOTE_SCRIPT'
 cd /root/muzhu-ai
 
 # 创建虚拟环境（如果不存在）
@@ -43,7 +51,10 @@ pip install -r requirements.txt -q
 
 # 初始化数据库
 echo "初始化数据库..."
-export PGPASSWORD=muzhu_pg_2024
+if [ -z "$PGPASSWORD" ]; then
+    echo "ERROR: PGPASSWORD environment variable must be set"
+    exit 1
+fi
 psql -h localhost -U muzhu -d muzhu_agent -f scripts/init_db.sql 2>/dev/null || echo "数据库表可能已存在"
 
 # 创建启动脚本

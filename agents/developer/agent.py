@@ -62,11 +62,15 @@ class DeveloperAgent(BaseAgent):
         llm_client: Optional[LLMClient] = None,
         message_bus: Any = None,
         base_dir: str = "/root",
+        memory_manager: Any = None,
+        **kwargs,
     ):
         super().__init__(
             role=DEVELOPER_ROLE,
             llm_client=llm_client,
             message_bus=message_bus,
+            memory_manager=memory_manager,
+            **kwargs,
         )
         self.base_dir = base_dir
         self.claude_code = ClaudeCodeTool(
@@ -280,6 +284,9 @@ class DeveloperAgent(BaseAgent):
             # 生成 product.md（供客服 Agent 使用）
             await self._generate_product_doc(client_dir, prd_content, deliverable_content)
 
+            # 存储构建经验到 KnowledgeMemory
+            await self._store_experience(client_name, prd_content, deliverable_content)
+
             # 生成完整的摘要
             summary = self._generate_summary(
                 client_name=client_name,
@@ -372,6 +379,64 @@ class DeveloperAgent(BaseAgent):
 
         except Exception as e:
             logger.error(f"生成 product.md 失败: {e}")
+
+    async def _store_experience(
+        self, client_name: str, prd_content: str, deliverable: str
+    ) -> None:
+        """
+        将构建经验存储到 KnowledgeMemory（Layer 3）
+
+        存储内容包括：
+        - 项目构建经验（用于未来类似需求参考）
+        - 技术选型和架构决策
+        """
+        if not self.memory_manager:
+            return
+
+        # 用 LLM 提炼经验总结
+        experience_text = deliverable
+        if self.llm:
+            try:
+                system_prompt = """你是一个经验提炼专家。从项目构建结果中提炼可复用的经验，用 2-3 句话总结。
+
+总结格式：
+- 项目类型 + 技术栈
+- 关键设计决策
+- 可复用的经验"""
+                messages = [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": f"客户需求：{prd_content[:500]}\n\n构建结果：{deliverable[:1000]}"},
+                ]
+                experience_text = await self.llm.chat(messages, temperature=0.3, max_tokens=300)
+            except Exception as e:
+                logger.warning(f"LLM 提炼经验失败，使用原始文本: {e}")
+
+        await self.remember(
+            content=experience_text,
+            memory_type="experience",
+            metadata={
+                "client_name": client_name,
+                "project_type": self._infer_project_type(prd_content),
+                "source": "developer_build",
+            },
+        )
+        logger.info(f"构建经验已存储: client={client_name}")
+
+    def _infer_project_type(self, prd_content: str) -> str:
+        """从 PRD 推断项目类型"""
+        prd_lower = prd_content.lower()
+        type_keywords = {
+            "website": ["网站", "官网", "web", "website", "网页", "主页"],
+            "web_app": ["应用", "系统", "平台", "后台", "管理", "app", "application"],
+            "ecommerce": ["电商", "商城", "购物", "店铺", "商品"],
+            "api": ["api", "接口", "服务"],
+            "mini_program": ["小程序", "微信"],
+            "landing": ["落地页", "landing", "宣传"],
+        }
+        for ptype, keywords in type_keywords.items():
+            if any(kw in prd_lower for kw in keywords):
+                return ptype
+        return "general"
 
     def _extract_client_name(self, prd_content: str) -> str:
         """从 PRD 中提取客户名称"""

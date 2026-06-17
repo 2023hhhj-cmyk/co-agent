@@ -87,11 +87,13 @@ class FrontendExpertAgent(BaseAgent):
         llm_client: Optional[LLMClient] = None,
         message_bus: Any = None,
         base_dir: str = "/root",
+        **kwargs,
     ):
         super().__init__(
             role=FRONTEND_EXPERT_ROLE,
             llm_client=llm_client,
             message_bus=message_bus,
+            **kwargs,
         )
         self.base_dir = base_dir
         self.claude_code = ClaudeCodeTool(

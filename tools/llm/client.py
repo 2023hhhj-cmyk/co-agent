@@ -20,13 +20,18 @@ logger = logging.getLogger(__name__)
 
 
 class LLMClient(ABC):
-    """LLM 客户端基类"""
+    """LLM 客户端基类（含缓存支持）"""
 
     def __init__(self, api_key: str, base_url: str, model: str):
         self.api_key = api_key
         self.base_url = base_url
         self.model = model
         self._client: Optional[httpx.AsyncClient] = None
+        self._cache: Any = None  # ResponseCache 实例
+
+    def set_cache(self, cache: Any) -> None:
+        """注入响应缓存"""
+        self._cache = cache
 
     async def _get_client(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
@@ -37,15 +42,66 @@ class LLMClient(ABC):
         if self._client and not self._client.is_closed:
             await self._client.aclose()
 
-    @abstractmethod
+    async def _check_cache(
+        self,
+        messages: List[Dict[str, str]],
+        temperature: float,
+        use_cache: bool = True,
+    ) -> Optional[str]:
+        """检查缓存"""
+        if not self._cache or not use_cache or temperature > 0.5:
+            return None
+        prompt = self._build_prompt_string(messages)
+        return await self._cache.get(prompt, self.model, temperature)
+
+    async def _store_cache(
+        self,
+        messages: List[Dict[str, str]],
+        temperature: float,
+        response: str,
+        success: bool,
+    ):
+        """存储到缓存"""
+        if self._cache and success:
+            prompt = self._build_prompt_string(messages)
+            await self._cache.set(prompt, self.model, temperature, response, success)
+
+    def _build_prompt_string(self, messages: List[Dict[str, str]]) -> str:
+        """构建 prompt 字符串用于缓存 key"""
+        return "\n".join(f"{m['role']}:{m.get('content', '')[:200]}" for m in messages[-10:])
+
     async def chat(
+        self,
+        messages: List[Dict[str, str]],
+        temperature: float = 0.7,
+        max_tokens: int = 4096,
+        use_cache: bool = True,
+        **kwargs,
+    ) -> str:
+        """基础对话（含缓存检查）"""
+        # 检查缓存
+        cached = await self._check_cache(messages, temperature, use_cache)
+        if cached:
+            return cached
+
+        # 调实际 API
+        try:
+            result = await self._chat_impl(messages, temperature, max_tokens, **kwargs)
+            await self._store_cache(messages, temperature, result, success=True)
+            return result
+        except Exception:
+            await self._store_cache(messages, temperature, "", success=False)
+            raise
+
+    @abstractmethod
+    async def _chat_impl(
         self,
         messages: List[Dict[str, str]],
         temperature: float = 0.7,
         max_tokens: int = 4096,
         **kwargs,
     ) -> str:
-        """基础对话，返回文本"""
+        """实际 API 调用（子类实现）"""
         pass
 
     async def chat_with_json(
@@ -98,7 +154,7 @@ class DeepSeekClient(LLMClient):
             model=model or settings.DEEPSEEK_MODEL,
         )
 
-    async def chat(
+    async def _chat_impl(
         self,
         messages: List[Dict[str, str]],
         temperature: float = 0.7,
@@ -133,7 +189,7 @@ class DeepSeekClient(LLMClient):
                 content = message["reasoning_content"]
             return content
         except Exception as e:
-            logger.error(f"DeepSeek API error: {e}")
+            logger.error(f"DeepSeek API call failed: {type(e).__name__}", exc_info=True)
             raise
 
 
@@ -151,7 +207,7 @@ class ClaudeClient(LLMClient):
             model=model,
         )
 
-    async def chat(
+    async def _chat_impl(
         self,
         messages: List[Dict[str, str]],
         temperature: float = 0.7,
@@ -193,5 +249,5 @@ class ClaudeClient(LLMClient):
             data = response.json()
             return data["content"][0]["text"]
         except Exception as e:
-            logger.error(f"Claude API error: {e}")
+            logger.error(f"Claude API call failed: {type(e).__name__}", exc_info=True)
             raise

@@ -1,0 +1,74 @@
+# Prometheus 告警规则
+# 用法：prometheus --config.file=prometheus.yml
+# 在 prometheus.yml 中添加：
+#   rule_files:
+#     - "alerts.yml"
+
+groups:
+  - name: muzhu_agent_alerts
+    rules:
+      # ========== Agent 错误告警 ==========
+      - alert: AgentError
+        expr: muzhu_agent_state == 2
+        for: 5m
+        labels:
+          severity: critical
+          component: agent
+        annotations:
+          summary: "Agent {{ $labels.agent }} is in error state"
+          description: "Agent {{ $labels.agent }} (role={{ $labels.role }}) has been in error state for 5 minutes"
+
+      # ========== 沙箱降级告警 ==========
+      - alert: SandboxDegraded
+        expr: muzhu_sandbox_mode == 0
+        for: 1m
+        labels:
+          severity: warning
+          component: security
+        annotations:
+          summary: "Sandbox is running in fallback readonly mode"
+          description: "Docker sandbox is unavailable, ClaudeCodeTool is limited to read-only operations. Check Docker daemon."
+
+      # ========== 输入拒绝率异常 ==========
+      - alert: HighInputRejectRate
+        expr: rate(muzhu_input_rejected_total[5m]) > 10
+        for: 5m
+        labels:
+          severity: warning
+          component: security
+        annotations:
+          summary: "High input rejection rate: {{ $value | humanize }}/s"
+          description: "InputGuard is rejecting more than 10 inputs per second. Possible attack or misconfiguration."
+
+      # ========== 客服队列积压 ==========
+      - alert: QueueOverflow
+        expr: muzhu_queue_depth > 100
+        for: 10m
+        labels:
+          severity: warning
+          component: customer_service
+        annotations:
+          summary: "CS queue depth is {{ $value }} (>100)"
+          description: "Customer service queue has over 100 pending messages. Customers may experience long wait times."
+
+      # ========== LLM 高延迟 ==========
+      - alert: LLMHighLatency
+        expr: histogram_quantile(0.95, rate(muzhu_llm_call_duration_seconds_bucket[5m])) > 30
+        for: 10m
+        labels:
+          severity: warning
+          component: llm
+        annotations:
+          summary: "LLM P95 latency is {{ $value }}s (>30s)"
+          description: "95th percentile LLM call duration exceeds 30 seconds. Check API provider status."
+
+      # ========== Agent 无活动 ==========
+      - alert: AgentNoActivity
+        expr: rate(muzhu_messages_processed_total[15m]) == 0
+        for: 15m
+        labels:
+          severity: info
+          component: agent
+        annotations:
+          summary: "Agent {{ $labels.agent }} has no activity for 15 minutes"
+          description: "Agent may be stuck or idle for too long."

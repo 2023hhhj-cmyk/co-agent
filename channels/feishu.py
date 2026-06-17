@@ -9,9 +9,12 @@
 """
 
 import asyncio
+import hashlib
+import hmac
 import json
 import logging
 import time
+from base64 import b64encode
 from typing import Any, Callable, Optional
 
 import httpx
@@ -44,6 +47,7 @@ class FeishuClient:
         self._ws_process = None
         self._msg_queue = None
         self._message_handler: Optional[Callable] = None
+        self._card_handler: Optional[Callable] = None
 
     async def _get_client(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
@@ -61,6 +65,10 @@ class FeishuClient:
     def set_message_handler(self, handler: Callable) -> None:
         """设置消息处理回调"""
         self._message_handler = handler
+
+    def set_card_handler(self, handler: Callable) -> None:
+        """设置卡片按钮回调处理"""
+        self._card_handler = handler
 
     def start_ws(self, loop: asyncio.AbstractEventLoop = None) -> None:
         """
@@ -151,10 +159,44 @@ class FeishuClient:
             except Exception as e:
                 logger.error(f"处理消息失败: {e}", exc_info=True)
 
-        event_handler = lark.EventDispatcherHandler.builder(
+        # 卡片按钮回调处理
+        def _on_card_action(data):
+            try:
+                # data.event 里有 action.value（按钮的 value）和 operator.open_id（点击者）
+                event = data.event
+                action = event.action
+                value = action.value or {}
+                operator_id = event.operator.open_id if event.operator else ""
+                chat_id = ""
+
+                # 从 context 中获取 chat_id
+                if hasattr(event, 'context') and event.context:
+                    chat_id = getattr(event.context, 'open_chat_id', '') or ''
+
+                logger.info(f"卡片回调: action={value.get('action')}, operator={operator_id}")
+
+                if self._card_handler:
+                    self._card_handler({
+                        "action": {"value": value},
+                        "open_id": operator_id,
+                        "open_chat_id": chat_id,
+                    })
+
+                # 返回 None 表示不更新卡片（lark SDK 会自动处理）
+                return None
+            except Exception as e:
+                logger.error(f"处理卡片回调失败: {e}", exc_info=True)
+                return None
+
+        builder = lark.EventDispatcherHandler.builder(
             settings.FEISHU_VERIFICATION_TOKEN,
             settings.FEISHU_ENCRYPT_KEY,
-        ).register_p2_im_message_receive_v1(_on_message).build()
+        ).register_p2_im_message_receive_v1(_on_message)
+
+        # 注册卡片回调处理器
+        builder.register_p2_card_action_trigger(_on_card_action)
+
+        event_handler = builder.build()
 
         ws_client = lark.ws.Client(
             self.app_id,
@@ -419,3 +461,31 @@ class FeishuClient:
             "sender_id": sender_id,
             "create_time": message.get("create_time", ""),
         }
+
+    @staticmethod
+    def verify_webhook_signature(
+        timestamp: str,
+        body_bytes: bytes,
+        verification_token: str,
+    ) -> str:
+        """
+        生成飞书 Webhook 签名字符串
+
+        飞书签名公式：
+            base64(hmac_sha256(verification_token, timestamp + "\\n" + verification_token + "\\n" + body))
+
+        Args:
+            timestamp: X-Lark-Request-Timestamp header
+            body_bytes: 原始请求体 bytes
+            verification_token: 飞书验证 Token
+
+        Returns:
+            签名 base64 字符串（与 X-Lark-Signature 比较）
+        """
+        message = f"{timestamp}\n{verification_token}\n{body_bytes.decode('utf-8')}"
+        computed = hmac.new(
+            verification_token.encode("utf-8"),
+            message.encode("utf-8"),
+            hashlib.sha256,
+        ).digest()
+        return b64encode(computed).decode("utf-8")
