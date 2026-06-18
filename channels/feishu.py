@@ -466,26 +466,43 @@ class FeishuClient:
     def verify_webhook_signature(
         timestamp: str,
         body_bytes: bytes,
-        verification_token: str,
+        app_secret: str,
+        encrypt_key: str = "",
     ) -> str:
         """
         生成飞书 Webhook 签名字符串
 
-        飞书签名公式：
-            base64(hmac_sha256(verification_token, timestamp + "\\n" + verification_token + "\\n" + body))
+        P0 #6 修复：原实现错误地把 verification_token 同时用作签名字段
+        和 HMAC 密钥。飞书官方算法是：
+            stringToSign = timestamp + "\\n" + encrypt_key + "\\n" + body
+            signature   = base64(HMAC-SHA256(key=app_secret, msg=stringToSign))
 
         Args:
             timestamp: X-Lark-Request-Timestamp header
-            body_bytes: 原始请求体 bytes
-            verification_token: 飞书验证 Token
+            body_bytes: 原始请求体 bytes（未解密时的 raw JSON）
+            app_secret: 飞书应用的 app_secret（HMAC 密钥）
+            encrypt_key: 飞书应用的 encrypt_key（stringToSign 第二段；未启用加密时传空串）
 
         Returns:
             签名 base64 字符串（与 X-Lark-Signature 比较）
+
+        Raises:
+            ValueError: app_secret 为空时
         """
-        message = f"{timestamp}\n{verification_token}\n{body_bytes.decode('utf-8')}"
+        if not app_secret:
+            raise ValueError("FEISHU_APP_SECRET 未配置，无法验证签名")
+
+        # 关键：body 必须是原始字节（飞书发送的 raw body），不是解密后的明文
+        # 这里我们只对 raw body 签名，调用方传入的就是 raw body
+        try:
+            body_str = body_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            body_str = body_bytes.decode("utf-8", errors="replace")
+
+        string_to_sign = f"{timestamp}\n{encrypt_key}\n{body_str}"
         computed = hmac.new(
-            verification_token.encode("utf-8"),
-            message.encode("utf-8"),
+            app_secret.encode("utf-8"),
+            string_to_sign.encode("utf-8"),
             hashlib.sha256,
         ).digest()
         return b64encode(computed).decode("utf-8")

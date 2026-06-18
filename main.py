@@ -7,6 +7,7 @@ Muzhu-AI 多Agent协同系统 - 主程序入口
 """
 
 import asyncio
+import hmac
 import json
 import logging
 from contextlib import asynccontextmanager
@@ -604,6 +605,11 @@ async def feishu_webhook(request: Request):
     1. URL 验证（challenge）
     2. 消息事件（im.message.receive_v1）
     3. 卡片回调（action）
+
+    P0 #6 修复：
+      - 强制要求 FEISHU_APP_SECRET 配置（未配置 → 启动 panic）
+      - 签名公式改为 app_secret + timestamp + encrypt_key + body
+      - 签名缺失/不匹配 → 401，不放行
     """
     # Step 0: 验证签名
     timestamp = request.headers.get("X-Lark-Request-Timestamp", "")
@@ -611,21 +617,49 @@ async def feishu_webhook(request: Request):
 
     body_bytes = await request.body()
 
-    if settings.FEISHU_VERIFICATION_TOKEN:
-        expected = FeishuClient.verify_webhook_signature(
-            timestamp, body_bytes, settings.FEISHU_VERIFICATION_TOKEN
+    # P0 #6 修复：app_secret 是签名验证的强制要求
+    if not settings.FEISHU_APP_SECRET:
+        logger.error("[Security] FEISHU_APP_SECRET 未配置，拒绝所有飞书 webhook 请求")
+        if audit_logger:
+            await audit_logger.log_auth_failure(
+                agent_id="system",
+                action="feishu_webhook",
+                reason="FEISHU_APP_SECRET not configured",
+            )
+        return JSONResponse(
+            status_code=503,
+            content={"error": "Service misconfigured: FEISHU_APP_SECRET required"},
         )
-        if signature != expected:
-            logger.warning(f"[Security] 飞书签名验证失败")
-            if audit_logger:
-                await audit_logger.log_auth_failure(
-                    agent_id="system",
-                    action="feishu_webhook",
-                    reason="signature verification failed",
-                )
-            return JSONResponse(status_code=401, content={"error": "Invalid signature"})
-    else:
-        logger.warning("FEISHU_VERIFICATION_TOKEN 未配置，跳过签名验证（不安全）")
+
+    if not signature or not timestamp:
+        logger.warning("[Security] 飞书 webhook 缺少签名头")
+        if audit_logger:
+            await audit_logger.log_auth_failure(
+                agent_id="system",
+                action="feishu_webhook",
+                reason="missing X-Lark-Signature or X-Lark-Request-Timestamp",
+            )
+        return JSONResponse(
+            status_code=401,
+            content={"error": "Missing signature headers"},
+        )
+
+    expected = FeishuClient.verify_webhook_signature(
+        timestamp, body_bytes,
+        app_secret=settings.FEISHU_APP_SECRET,
+        encrypt_key=settings.FEISHU_ENCRYPT_KEY,
+    )
+
+    # 恒定时间比较，避免计时攻击
+    if not hmac.compare_digest(expected, signature):
+        logger.warning("[Security] 飞书签名验证失败")
+        if audit_logger:
+            await audit_logger.log_auth_failure(
+                agent_id="system",
+                action="feishu_webhook",
+                reason="signature verification failed",
+            )
+        return JSONResponse(status_code=401, content={"error": "Invalid signature"})
 
     body = json.loads(body_bytes.decode("utf-8"))
     logger.info(f"收到飞书回调: {json.dumps(body, ensure_ascii=False)[:200]}")
@@ -664,6 +698,9 @@ async def feishu_webhook(request: Request):
         action_data = body.get("action", {})
         value = action_data.get("value", {})
         chat_id = body.get("open_chat_id", "")
+        # P0 #5 修复：从 operator.open_id 提取点击者身份，用于横向越权校验
+        operator = body.get("operator", {}) or {}
+        sender_open_id = operator.get("open_id", "")
         if value and chat_id:
             ceo = agents.get("ceo")
             if ceo:
@@ -672,6 +709,7 @@ async def feishu_webhook(request: Request):
                         chat_id=chat_id,
                         text=json.dumps(value),
                         message_id=body.get("open_message_id", ""),
+                        sender_id=sender_open_id,
                     )
                 )
         # 卡片回调返回空字典（不更新卡片）
@@ -775,6 +813,19 @@ async def wecom_ceo_callback(request: Request):
 
             # 通过智能机器人的 response_url 回复
             if response_url and response:
+                # P0 #4 修复：response_url 来自回调体，先做白名单校验（防 SSRF + 数据外泄）
+                try:
+                    WecomClient._validate_response_url(response_url)
+                except ValueError as e:
+                    logger.error(f"[SSRF] 拒绝可疑 response_url: {e}")
+                    if audit_logger:
+                        await audit_logger.log_auth_failure(
+                            agent_id="ceo",
+                            action="wecom_response_url_blocked",
+                            reason=str(e),
+                        )
+                    return {"error": "Invalid response URL"}
+
                 client = await wecom_ceo_client._get_client()
                 resp = await client.post(
                     response_url,

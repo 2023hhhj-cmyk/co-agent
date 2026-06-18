@@ -15,6 +15,7 @@
 
 import asyncio
 import hashlib
+import hmac
 import json
 import logging
 import struct
@@ -44,10 +45,14 @@ class WecomCrypto:
         self.iv = self.aes_key[:16]
 
     def verify_signature(self, msg_signature: str, timestamp: str, nonce: str, encrypt: str) -> bool:
-        """验证消息签名"""
+        """验证消息签名
+
+        使用 hmac.compare_digest 做恒定时间比较，避免计时攻击。
+        攻击者原本可以通过响应时间差逐字符推断 SHA1 签名。
+        """
         params = sorted([self.token, timestamp, nonce, encrypt])
         sha1 = hashlib.sha1("".join(params).encode("utf-8")).hexdigest()
-        return sha1 == msg_signature
+        return hmac.compare_digest(sha1, msg_signature or "")
 
     def decrypt(self, encrypt: str) -> str:
         """解密消息"""
@@ -120,6 +125,8 @@ class WecomClient:
         # token 缓存
         self._access_token: str = ""
         self._token_expire_at: float = 0
+        # token 刷新锁：防止并发 webhook 触发重复刷新（P0 #3 修复）
+        self._token_lock: asyncio.Lock = asyncio.Lock()
 
         # HTTP 客户端
         self._client: Optional[httpx.AsyncClient] = None
@@ -142,37 +149,42 @@ class WecomClient:
         """
         获取 access_token
 
-        企业微信 token 有效期 2 小时，提前 5 分钟刷新
+        企业微信 token 有效期 2 小时，提前 5 分钟刷新。
+
+        并发安全：使用 asyncio.Lock 串行化刷新逻辑。
+        双检锁模式：先无锁快速路径（已缓存且未过期），未命中再加锁再次检查，
+        避免每次请求都拿锁；同时保证并发刷新只发生一次。
         """
+        # 快速路径：无锁检查，绝大多数请求命中此处
         now = time.time()
         if self._access_token and now < self._token_expire_at - 300:
             return self._access_token
 
-        client = await self._get_client()
-        resp = await client.get(
-            f"{WECOM_API_BASE}/token",
-            params={
-                "corpid": self.corp_id,
-                "corpsecret": self.secret,
-            },
-        )
-        resp.raise_for_status()
-        data = resp.json()
+        # 慢速路径：加锁刷新
+        async with self._token_lock:
+            # Double-check：其他协程可能在我们等锁时已完成刷新
+            now = time.time()
+            if self._access_token and now < self._token_expire_at - 300:
+                return self._access_token
 
-        if data.get("errcode") != 0:
-            raise Exception(f"获取企业微信 token 失败: {data}")
+            client = await self._get_client()
+            resp = await client.get(
+                f"{WECOM_API_BASE}/token",
+                params={
+                    "corpid": self.corp_id,
+                    "corpsecret": self.secret,
+                },
+            )
+            resp.raise_for_status()
+            data = resp.json()
 
-        self._access_token = data["access_token"]
-        self._token_expire_at = now + data.get("expires_in", 7200)
-        logger.info("企业微信 access_token 已刷新")
-        return self._access_token
+            if data.get("errcode") != 0:
+                raise Exception(f"获取企业微信 token 失败: {data}")
 
-    async def _auth_headers(self) -> dict[str, str]:
-        """获取带认证的请求头"""
-        token = await self._get_access_token()
-        return {
-            "Content-Type": "application/json; charset=utf-8",
-        }
+            self._access_token = data["access_token"]
+            self._token_expire_at = now + data.get("expires_in", 7200)
+            logger.info("企业微信 access_token 已刷新")
+            return self._access_token
 
     async def _auth_params(self) -> dict[str, str]:
         """获取带认证的查询参数"""
@@ -264,6 +276,81 @@ class WecomClient:
 
     # ========== 发送消息 ==========
 
+    # 允许的 response_url 主机白名单（防 SSRF + 数据外泄）
+    _ALLOWED_RESPONSE_URL_HOSTS = (
+        "qq.com",
+        "tencent.com",
+        "weixin.qq.com",
+    )
+
+    @classmethod
+    def _validate_response_url(cls, url: str) -> str:
+        """
+        校验 response_url 合法性（P0 #4 修复）
+
+        攻击场景：response_url 来自企业微信回调体的明文字段，攻击者可构造
+        加密消息携带恶意 URL，触发：
+          1. SSRF 探测内网（http://127.0.0.1:6379/）
+          2. 数据外泄（携带 CEO 回复内容去任意 https 端点）
+
+        校验顺序（先严格后宽松）：
+          1. scheme 必须是 https
+          2. 必须有 host
+          3. 禁止 IP 字面量（先于白名单检查，防止数字 IP 绕过域名白名单）
+          4. host 必须在白名单内（qq.com / tencent.com / weixin.qq.com）
+          5. 解析 DNS 后禁止内网/回环/链路本地（防 DNS rebinding）
+        """
+        import ipaddress
+        import socket
+        from urllib.parse import urlparse
+
+        if not url or not isinstance(url, str):
+            raise ValueError("[SSRF] response_url 为空")
+
+        try:
+            parsed = urlparse(url.strip())
+        except Exception as e:
+            raise ValueError(f"[SSRF] response_url 解析失败: {e}")
+
+        # 1. scheme 检查
+        if parsed.scheme.lower() != "https":
+            raise ValueError(f"[SSRF] response_url 必须使用 https，实际: {parsed.scheme}")
+
+        host = (parsed.hostname or "").lower()
+        if not host:
+            raise ValueError("[SSRF] response_url 缺少 host")
+
+        # 2. 禁止 IP 字面量（先于白名单，否则 1.2.3.4 不匹配任何白名单会误报）
+        try:
+            ipaddress.ip_address(host)
+            raise ValueError(f"[SSRF] response_url 不允许 IP 字面量: {host}")
+        except ValueError as e:
+            if "不允许 IP 字面量" in str(e):
+                raise
+            # ip_address 抛 ValueError 表示不是合法 IP（正常域名），放行
+
+        # 3. 白名单检查（host 本身或父域匹配）
+        if not any(host == h or host.endswith("." + h) for h in cls._ALLOWED_RESPONSE_URL_HOSTS):
+            raise ValueError(f"[SSRF] response_url host 不在白名单: {host}")
+
+        # 4. 解析 DNS 后禁止内网/回环/链路本地（防 DNS rebinding）
+        try:
+            resolved_ip = socket.gethostbyname(host)
+            ip_obj = ipaddress.ip_address(resolved_ip)
+            if (
+                ip_obj.is_private
+                or ip_obj.is_loopback
+                or ip_obj.is_link_local
+                or ip_obj.is_multicast
+                or ip_obj.is_reserved
+                or ip_obj.is_unspecified
+            ):
+                raise ValueError(f"[SSRF] response_url 解析到内网地址: {host} -> {resolved_ip}")
+        except socket.gaierror as e:
+            raise ValueError(f"[SSRF] response_url DNS 解析失败: {host} ({e})")
+
+        return url
+
     async def send_text_to_external(self, external_userid: str, text: str, response_url: str = "") -> dict:
         """
         发送文本消息给外部联系人（客户）
@@ -273,7 +360,7 @@ class WecomClient:
         Args:
             external_userid: 外部联系人 ID
             text: 消息文本
-            response_url: 智能机器人的回复 URL（如果有）
+            response_url: 智能机器人的回复 URL（如果有，必须通过白名单校验）
 
         Returns:
             API 响应
@@ -282,6 +369,9 @@ class WecomClient:
 
         # 智能机器人使用 response_url 回复
         if response_url:
+            # P0 #4 修复：response_url 来自回调体，先做白名单校验
+            self._validate_response_url(response_url)
+
             resp = await client.post(
                 response_url,
                 json={

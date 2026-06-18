@@ -75,6 +75,7 @@ class ProjectPlan(BaseModel):
     status: str = "planning"       # planning / confirmed / executing / completed / failed
     chat_id: str = ""              # 飞书会话 ID
     user_message_id: str = ""      # 触发计划的飞书消息 ID
+    creator_sender_id: str = ""    # P0 #5 修复：发起计划的发送者 open_id，用于横向越权防护
     created_at: datetime = Field(default_factory=datetime.now)
     completed_at: Optional[datetime] = None
 
