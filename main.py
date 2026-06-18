@@ -22,6 +22,19 @@ from slowapi import Limiter
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 
+
+# P2 #19 修复：限流 key 函数
+# 默认用 client.host，企业 NAT 后所有员工共享同一 IP → 配额被极少数人耗尽
+# 改用 X-Forwarded-For 头（需配合 nginx `set_header X-Forwarded-For $proxy_add_x_forwarded_for`）
+# 无 XFF 时回退到 client.host
+def _rate_limit_key(request: Request) -> str:
+    """优先使用 X-Forwarded-For，否则回退 client.host"""
+    xff = request.headers.get("X-Forwarded-For")
+    if xff:
+        # 取第一个 IP（最左为真实客户端）
+        return xff.split(",")[0].strip()
+    return get_remote_address(request)
+
 from agents import (
     CEOAgent,
     CustomerServiceAgent,
@@ -180,15 +193,33 @@ async def lifespan(app: FastAPI):
     await state_manager.connect()
     await database.connect()
 
+    # P2 #18 修复：验证 Redis 持久化配置（消息队列依赖）
+    # 若 Redis 未启用 AOF，进程崩溃时消息可能丢失
+    try:
+        aof_enabled = await state_manager.redis.config_get("appendonly")
+        if aof_enabled.get("appendonly") != "yes":
+            logger.warning(
+                "[Security] Redis AOF 未启用 (appendonly=no)。"
+                "消息队列持久化在崩溃场景下可能丢失。建议设置 appendonly=yes。"
+            )
+    except Exception as e:
+        logger.warning(f"无法检查 Redis AOF 状态: {e}")
+
     # 初始化安全系统
     global input_guard, sandbox, policy_enforcer, audit_logger
     input_guard = InputGuard()
-    sandbox = SandboxedExecutor(base_dir="/root")
+    # P2 #24 修复：Sandbox 初始化失败不应阻塞 app 启动
+    try:
+        sandbox = SandboxedExecutor(base_dir="/root")
+    except Exception as e:
+        logger.warning(f"[Security] 沙箱初始化失败（降级到无沙箱模式）: {e}")
+        sandbox = None
     policy_enforcer = PolicyEnforcer()
     audit_logger = AuditLogger(database=database)
     logger.info(
         f"安全系统初始化完成: "
-        f"InputGuard + Sandbox({sandbox.mode}) + PolicyEnforcer + AuditLogger"
+        f"InputGuard + Sandbox({sandbox.mode if sandbox else 'disabled'}) + "
+        f"PolicyEnforcer + AuditLogger"
     )
 
     # 初始化可观测性
@@ -233,9 +264,13 @@ async def lifespan(app: FastAPI):
     )
     logger.info("三层记忆系统 + 关联图谱初始化完成")
 
-    # 创建 Agent
-    create_agents()
-    logger.info(f"Agents created: {list(agents.keys())}")
+    # 创建 Agent（P2 #24 修复：单个 Agent 失败不阻塞整个启动）
+    try:
+        create_agents()
+        logger.info(f"Agents created: {list(agents.keys())}")
+    except Exception as e:
+        logger.error(f"[Critical] Agent 创建失败: {e}", exc_info=True)
+        # 不 raise，让 app 至少能响应 /health 端点
 
     # 启动飞书 WebSocket 长连接
     async def handle_feishu_message(parsed: dict):
@@ -342,7 +377,7 @@ app.add_middleware(
 )
 
 # 速率限制器
-limiter = Limiter(key_func=get_remote_address, default_limits=[settings.RATE_LIMIT])
+limiter = Limiter(key_func=_rate_limit_key, default_limits=[settings.RATE_LIMIT])
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, lambda request, exc: JSONResponse(
     status_code=429,
@@ -707,6 +742,18 @@ async def feishu_webhook(request: Request):
             if not text:
                 return {"code": 0}
 
+            # P2 #25 修复：webhook 幂等性（飞书会重试）
+            if state_manager and message_id:
+                try:
+                    is_first = await state_manager.dedup_check(
+                        f"feishu_msg:{message_id}", ttl=86400
+                    )
+                    if not is_first:
+                        logger.info(f"飞书重复消息，跳过: message_id={message_id}")
+                        return {"code": 0}
+                except Exception as e:
+                    logger.warning(f"[P2 #25] 飞书去重检查失败: {e}")
+
             # 异步交给 CEO 处理
             ceo = agents.get("ceo")
             if ceo:
@@ -988,6 +1035,17 @@ async def wecom_cs_callback(request: Request):
         return {"error": "Empty message"}
 
     logger.info(f"企业微信客服收到消息: from={from_user}, content={content[:50]}...")
+
+    # P2 #25 修复：webhook 幂等性（企业微信 5 秒超时重试）
+    # 用 Redis SETNX 去重，避免重复入队
+    if state_manager and msg_id:
+        try:
+            is_first = await state_manager.dedup_check(f"wecom_cs:{msg_id}", ttl=86400)
+            if not is_first:
+                logger.info(f"CS 重复消息，跳过入队: msg_id={msg_id}")
+                return {"code": 0}
+        except Exception as e:
+            logger.warning(f"[P2 #25] CS 去重检查失败: {e}")
 
     # 放入队列
     cs_queue = CSMessageQueue(state_manager.redis)

@@ -111,7 +111,14 @@ class LLMClient(ABC):
         max_tokens: int = 4096,
         **kwargs,
     ) -> Dict:
-        """结构化对话，返回 JSON"""
+        """结构化对话，返回 JSON
+
+        P2 #20 修复：增强解析鲁棒性
+          - 支持 markdown 代码块（多种语言标签）
+          - 支持 LLM 在 JSON 前后加的散文（如 "Here's the answer: {...}"）
+          - 多次尝试不同剥离策略
+          - 失败时不静默：返回包含 _parse_error 字段的字典便于调试
+        """
         # 在 user message 末尾添加 JSON 输出要求
         modified_messages = messages.copy()
         if modified_messages and modified_messages[-1]["role"] == "user":
@@ -124,19 +131,74 @@ class LLMClient(ABC):
             **kwargs,
         )
 
-        # 尝试解析 JSON
-        try:
-            # 处理可能的 markdown 代码块
-            text = response.strip()
-            if text.startswith("```"):
-                text = text.split("\n", 1)[1] if "\n" in text else text[3:]
-                if text.endswith("```"):
-                    text = text[:-3]
-                text = text.strip()
-            return json.loads(text)
-        except json.JSONDecodeError:
-            logger.warning(f"Failed to parse JSON from LLM response: {response[:200]}")
-            return {"raw_response": response}
+        # P2 #20：多种策略依次尝试
+        text = response.strip()
+        candidates = self._extract_json_candidates(text)
+
+        for candidate in candidates:
+            try:
+                return json.loads(candidate)
+            except json.JSONDecodeError:
+                continue
+
+        # 全部失败：不静默，记录错误详情
+        logger.warning(
+            f"[P2 #20] Failed to parse JSON from LLM response. "
+            f"Tried {len(candidates)} candidates. Response preview: {response[:300]}"
+        )
+        return {
+            "raw_response": response,
+            "_parse_error": "Failed to extract valid JSON",
+        }
+
+    @staticmethod
+    def _extract_json_candidates(text: str) -> List[str]:
+        """从 LLM 响应中提取可能的 JSON 候选
+
+        策略（按优先级）：
+        1. 完整文本（如果本身就是合法 JSON）
+        2. 去掉 markdown 代码块包裹
+        3. 提取第一个 {...} 块
+        4. 提取第一个 [...] 块
+        """
+        candidates: List[str] = []
+
+        # 1. 原文
+        candidates.append(text)
+
+        # 2. 去掉 markdown 代码块
+        cleaned = text
+        if cleaned.startswith("```"):
+            # 去掉开头的 ```json / ``` / ```JSON 等
+            first_newline = cleaned.find("\n")
+            if first_newline > 0:
+                cleaned = cleaned[first_newline + 1:]
+            else:
+                cleaned = cleaned[3:]
+            # 去掉结尾的 ```
+            if cleaned.endswith("```"):
+                cleaned = cleaned[:-3]
+            cleaned = cleaned.strip()
+            if cleaned != text:
+                candidates.append(cleaned)
+
+        # 3. 提取第一个 {...} 块
+        obj_start = text.find("{")
+        obj_end = text.rfind("}")
+        if obj_start != -1 and obj_end > obj_start:
+            obj_str = text[obj_start:obj_end + 1]
+            if obj_str not in candidates:
+                candidates.append(obj_str)
+
+        # 4. 提取第一个 [...] 块
+        arr_start = text.find("[")
+        arr_end = text.rfind("]")
+        if arr_start != -1 and arr_end > arr_start:
+            arr_str = text[arr_start:arr_end + 1]
+            if arr_str not in candidates:
+                candidates.append(arr_str)
+
+        return candidates
 
 
 class DeepSeekClient(LLMClient):

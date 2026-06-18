@@ -216,8 +216,7 @@ class ServiceMonitor:
         """
         处理不健康的服务
 
-        Args:
-            service_name: 服务名称
+        P2 #23 修复：每个回调包 try/except，避免一个回调失败导致后续操作（如 docker.restart）跳过
         """
         service = self.services.get(service_name)
         if not service:
@@ -228,18 +227,24 @@ class ServiceMonitor:
             logger.error(f"服务 {service_name} 已达到最大重启次数，标记为失败")
             service.mark_failed(f"健康检查失败，已重启 {service.restart_count} 次")
 
-            # 调用失败回调
+            # P2 #23：失败回调包 try/except
             if self._on_failure:
-                await self._on_failure(service_name, service.error_message)
+                try:
+                    await self._on_failure(service_name, service.error_message)
+                except Exception as e:
+                    logger.error(f"[P2 #23] 失败回调异常: {e}", exc_info=True)
             return
 
         # 尝试重启
         logger.info(f"尝试重启服务 {service_name}（第 {service.restart_count + 1} 次）")
         service.mark_restarting()
 
-        # 调用重启回调
+        # P2 #23：重启回调包 try/except
         if self._on_restart:
-            await self._on_restart(service_name, service.restart_count)
+            try:
+                await self._on_restart(service_name, service.restart_count)
+            except Exception as e:
+                logger.error(f"[P2 #23] 重启回调异常: {e}", exc_info=True)
 
         # 执行重启
         success = await self.docker.restart(service.container_name)
@@ -256,13 +261,27 @@ class ServiceMonitor:
                 logger.info(f"服务 {service_name} 重启成功")
                 service.mark_running()
 
-                # 调用恢复回调
+                # P2 #23：恢复回调包 try/except
                 if self._on_recovered:
-                    await self._on_recovered(service_name)
+                    try:
+                        await self._on_recovered(service_name)
+                    except Exception as e:
+                        logger.error(f"[P2 #23] 恢复回调异常: {e}", exc_info=True)
             else:
                 logger.warning(f"服务 {service_name} 重启后仍然不健康")
         else:
             logger.error(f"服务 {service_name} 重启失败")
+
+    async def _safe_invoke_callback(self, callback, *args) -> None:
+        """P2 #23：通用回调安全调用包装"""
+        if callback is None:
+            return
+        try:
+            result = callback(*args)
+            if asyncio.iscoroutine(result):
+                await result
+        except Exception as e:
+            logger.error(f"[P2 #23] 回调异常: {e}", exc_info=True)
 
     async def get_all_status(self) -> list[dict]:
         """

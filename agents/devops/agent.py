@@ -540,19 +540,56 @@ class DevOpsAgent(BaseAgent):
         return safe_name or f"service-{datetime.now().strftime('%Y%m%d%H%M%S')}"
 
     async def _write_config_files(self, project_dir: str, project_info, service_name: str):
-        """写入 Dockerfile 和 docker-compose.yml"""
+        """写入 Dockerfile 和 docker-compose.yml
+
+        P2 #22 修复：避免覆盖用户已有的配置文件
+          - 文件已存在时，先备份（.bak.<timestamp>）再写
+          - 在 audit log 记录"覆盖 vs 首次创建"
+        """
         import os
+        import time
 
         # 写入 Dockerfile
         dockerfile_path = os.path.join(project_dir, "Dockerfile")
-        with open(dockerfile_path, 'w', encoding='utf-8') as f:
-            f.write(project_info.dockerfile_content)
+        self._safe_write_file(dockerfile_path, project_info.dockerfile_content, ".bak")
 
         # 写入 docker-compose.yml
         compose_path = os.path.join(project_dir, "docker-compose.yml")
         compose_content = project_info.compose_content.replace("{{PORT}}", "8000")
-        with open(compose_path, 'w', encoding='utf-8') as f:
-            f.write(compose_content)
+        self._safe_write_file(compose_path, compose_content, ".bak")
+
+    @staticmethod
+    def _safe_write_file(path: str, content: str, backup_suffix: str = ".bak") -> str:
+        """P2 #22：写入文件时先备份已有内容
+
+        Args:
+            path: 目标文件路径
+            content: 新内容
+            backup_suffix: 备份文件后缀
+
+        Returns:
+            "created" | "updated" | "updated_with_backup"
+        """
+        import os
+        import time
+
+        if os.path.exists(path):
+            # 文件已存在：先备份
+            timestamp = int(time.time())
+            backup_path = f"{path}{backup_suffix}.{timestamp}"
+            try:
+                os.rename(path, backup_path)
+                logger.info(f"[P2 #22] 备份已存在文件: {path} -> {backup_path}")
+                mode = "updated_with_backup"
+            except Exception as e:
+                logger.warning(f"[P2 #22] 备份失败，直接覆盖: {e}")
+                mode = "updated"
+        else:
+            mode = "created"
+
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(content)
+        return mode
 
     def _detect_internal_port(self, project_info) -> int:
         """检测容器内部端口"""

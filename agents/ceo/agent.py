@@ -273,7 +273,7 @@ class CEOAgent(BaseAgent):
                 if intent in response:
                     return intent
         except Exception as e:
-            logger.error(f"意图分类失败: {e}")
+            logger.error(f"意图分类失败: {e}", exc_info=True)
 
         return "new_requirement"
 
@@ -346,7 +346,7 @@ class CEOAgent(BaseAgent):
             else:
                 return False, response
         except Exception as e:
-            logger.error(f"需求完整性检查失败: {e}")
+            logger.error(f"需求完整性检查失败: {e}", exc_info=True)
             return True, ""  # 出错时默认完整，不阻塞流程
 
     # ========== 任务拆解 ==========
@@ -435,7 +435,7 @@ Developer 使用 Claude Code 构建产品，它需要清晰的输入。给 Devel
             return plan
 
         except Exception as e:
-            logger.error(f"任务拆解失败: {e}")
+            logger.error(f"任务拆解失败: {e}", exc_info=True)
             return self._default_plan(requirement, chat_id, message_id)
 
     def _build_template_context(self) -> str:
@@ -603,7 +603,7 @@ Developer 使用 Claude Code 构建产品，它需要清晰的输入。给 Devel
             await executor.execute(input_message, extra_context=extra_context)
 
         except Exception as e:
-            logger.error(f"工作流执行失败: {e}")
+            logger.error(f"工作流执行失败: {e}", exc_info=True)
             await self._send_feishu_text(chat_id, f"⚠️ 执行过程中出现问题: {str(e)[:200]}")
 
         # 5. 标记失败的任务
@@ -791,7 +791,7 @@ Developer 使用 Claude Code 构建产品，它需要清晰的输入。给 Devel
                 return ""
 
         except Exception as e:
-            logger.error(f"读取项目文件失败: {e}")
+            logger.error(f"读取项目文件失败: {e}", exc_info=True)
             return ""
 
     @staticmethod
@@ -881,7 +881,7 @@ Developer 使用 Claude Code 构建产品，它需要清晰的输入。给 Devel
             else:
                 await self.feishu.send_text(chat_id, text)
         except Exception as e:
-            logger.error(f"飞书发送失败: {e}")
+            logger.error(f"飞书发送失败: {e}", exc_info=True)
 
     # ========== Active Plan 持久化（Redis + 内存 fallback）==========
 
@@ -966,7 +966,7 @@ Developer 使用 Claude Code 构建产品，它需要清晰的输入。给 Devel
                     )
 
         except Exception as e:
-            logger.error(f"项目记忆归档失败: {e}")
+            logger.error(f"项目记忆归档失败: {e}", exc_info=True)
 
     # ========== BaseAgent 接口实现 ==========
 
