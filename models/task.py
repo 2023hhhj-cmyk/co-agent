@@ -87,7 +87,17 @@ class ProjectPlan(BaseModel):
         return None
 
     def get_ready_tasks(self) -> list[Task]:
-        """获取可以执行的任务（依赖已满足）"""
+        """获取可以执行的任务（依赖已满足 + 用户已确认）
+
+        即：状态为 CONFIRMED 且所有依赖任务都已 COMPLETED 的任务。
+        这些任务可被 WorkflowExecutor 立即派发。
+
+        注意命名澄清（避免与"pending"混淆）：
+          - PENDING  = 拆解完成，等用户确认
+          - CONFIRMED = 用户已确认，等依赖完成
+          - RUNNING  = 正在执行
+          - WAITING_DEP = 等待依赖
+        """
         completed_ids = {t.id for t in self.tasks if t.status == TaskStatus.COMPLETED}
         ready = []
         for task in self.tasks:
@@ -97,8 +107,32 @@ class ProjectPlan(BaseModel):
         return ready
 
     def get_running_tasks(self) -> list[Task]:
-        """获取正在执行的任务"""
+        """获取正在执行的任务（状态 = RUNNING）"""
         return [t for t in self.tasks if t.status == TaskStatus.RUNNING]
+
+    def get_pending_tasks(self) -> list[Task]:
+        """P3 #33 补充：获取待用户确认的任务（状态 = PENDING）
+
+        之前只有 get_ready_tasks（CONFIRMED + 依赖完成），缺一个
+        "等用户点头"的状态查询。本方法补足。
+        """
+        return [t for t in self.tasks if t.status == TaskStatus.PENDING]
+
+    def get_waiting_tasks(self) -> list[Task]:
+        """P3 #33 补充：获取等待依赖的任务（状态 = WAITING_DEP）"""
+        return [t for t in self.tasks if t.status == TaskStatus.WAITING_DEP]
+
+    def count_by_status(self) -> dict[str, int]:
+        """P3 #33 补充：按状态统计任务数量
+
+        Returns:
+            例：{"pending": 2, "confirmed": 1, "running": 0, "completed": 3, "failed": 0, "waiting_dep": 1}
+        """
+        result: dict[str, int] = {}
+        for task in self.tasks:
+            key = task.status.value
+            result[key] = result.get(key, 0) + 1
+        return result
 
     def is_all_done(self) -> bool:
         """是否所有任务都已完成"""
@@ -113,10 +147,17 @@ class ProjectPlan(BaseModel):
         for task in self.tasks:
             lines.append(task.to_summary())
 
+        # P3 #33 改进：使用 count_by_status 提供更丰富的进度信息
+        counts = self.count_by_status()
         total = len(self.tasks)
-        done = sum(1 for t in self.tasks if t.status == TaskStatus.COMPLETED)
-        failed = sum(1 for t in self.tasks if t.status == TaskStatus.FAILED)
-        lines.append(f"\n进度: {done}/{total} 完成, {failed} 失败")
+        done = counts.get(TaskStatus.COMPLETED.value, 0)
+        failed = counts.get(TaskStatus.FAILED.value, 0)
+        running = counts.get(TaskStatus.RUNNING.value, 0)
+        waiting = counts.get(TaskStatus.WAITING_DEP.value, 0)
+        lines.append(
+            f"\n进度: {done}/{total} 完成, {failed} 失败, "
+            f"{running} 运行中, {waiting} 等待依赖"
+        )
         return "\n".join(lines)
 
     def to_confirm_card(self) -> dict:
