@@ -14,6 +14,7 @@ IDLE → CLASSIFY → CHECK_COMPLETENESS → DECOMPOSE → WAIT_CONFIRM → EXEC
 """
 
 import asyncio
+import contextvars
 import json
 import logging
 import uuid
@@ -36,6 +37,19 @@ from workflows.executor import WorkflowExecutor
 from workflows.graph import WorkflowGraph
 
 logger = logging.getLogger(__name__)
+
+# P1 #8 修复：使用 contextvars 隔离每个请求的上下文
+# 原代码用 self._current_sender_id 等实例字段，在 FastAPI 并发请求下会串扰
+# ContextVar 在 asyncio 任务间自动隔离，每个协程独立
+_current_sender_id: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "ceo_current_sender_id", default=""
+)
+_current_chat_id: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "ceo_current_chat_id", default=""
+)
+_current_chat_type: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "ceo_current_chat_type", default="p2p"
+)
 
 # CEO 角色定义
 CEO_ROLE = AgentRole(
@@ -168,10 +182,10 @@ class CEOAgent(BaseAgent):
         if len(self._processed_messages) > 10000:
             self._processed_messages = set(list(self._processed_messages)[-5000:])
 
-        # 记录会话上下文（用于后续发送消息）
-        self._current_chat_id = chat_id
-        self._current_sender_id = sender_id
-        self._current_chat_type = chat_type
+        # P1 #8 修复：使用 ContextVar 而非实例字段，避免并发请求串扰
+        _current_chat_id.set(chat_id)
+        _current_sender_id.set(sender_id)
+        _current_chat_type.set(chat_type)
 
         logger.info(f"CEO 收到飞书消息: chat_id={chat_id}, text={text[:50]}...")
 
@@ -286,7 +300,7 @@ class CEOAgent(BaseAgent):
             return
 
         # P0 #5 修复：记录发起者 sender_id，横向越权防护
-        plan.creator_sender_id = self._current_sender_id
+        plan.creator_sender_id = _current_sender_id.get()
 
         # 保存计划
         self._active_plans[chat_id] = plan
@@ -502,7 +516,7 @@ Developer 使用 Claude Code 构建产品，它需要清晰的输入。给 Devel
             return
 
         # P0 #5：横向越权防护
-        current_sender = self._current_sender_id
+        current_sender = _current_sender_id.get()
         if plan.creator_sender_id and current_sender and current_sender != plan.creator_sender_id:
             logger.warning(
                 f"[Security] 横向越权拦截: sender={current_sender} 尝试操作 plan={plan_id} "
@@ -858,10 +872,12 @@ Developer 使用 Claude Code 构建产品，它需要清晰的输入。给 Devel
             logger.warning(f"飞书客户端未初始化，消息未发送: {text[:50]}")
             return
         try:
+            # P1 #8 修复：从 ContextVar 读取 chat_type 和 sender_id
+            chat_type = _current_chat_type.get() or "p2p"
+            sender_id = _current_sender_id.get()
             # 私聊用 open_id 发送，群聊用 chat_id
-            chat_type = getattr(self, "_current_chat_type", "p2p")
-            if chat_type == "p2p" and self._current_sender_id:
-                await self.feishu.send_to_user(self._current_sender_id, text)
+            if chat_type == "p2p" and sender_id:
+                await self.feishu.send_to_user(sender_id, text)
             else:
                 await self.feishu.send_text(chat_id, text)
         except Exception as e:

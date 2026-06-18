@@ -32,8 +32,10 @@ SANDBOX_TIMEOUT = 300  # 5 分钟
 MEMORY_LIMIT = "512m"
 CPU_LIMIT = "1.0"
 
-# 降级模式允许的工具（只读）
-READONLY_TOOLS = ["Read", "Bash(read-only)", "Glob", "Grep"]
+# 降级模式允许的工具（只读 — P1 #13 修复）
+# P1 #13: 原 "Bash(read-only)" 不是合法 Claude Code 工具名，会被忽略。
+# 实际做法：降级模式只给只读工具，完全不暴露 Bash
+READONLY_TOOLS = ["Read", "Glob", "Grep"]
 # 完整工具集
 FULL_TOOLS = ["Read", "Write", "Edit", "Bash", "Glob", "Grep"]
 
@@ -147,7 +149,10 @@ class SandboxedExecutor:
             "--cpus", CPU_LIMIT,
             "--network", "none",
             "--read-only",
-            "--tmpfs", "/tmp:rw,exec,size=256m",
+            # P1 #12 修复：tmpfs 改 noexec，防止攻击者放编译后的二进制
+            # 同时加 --security-opt no-new-privileges 防止 setuid 提权
+            "--tmpfs", "/tmp:rw,noexec,size=256m",
+            "--security-opt", "no-new-privileges",
             "-v", f"{cwd}:/workspace:rw",
             "-w", "/workspace",
             self.docker_image,

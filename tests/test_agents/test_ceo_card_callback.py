@@ -8,6 +8,7 @@ import pytest
 
 from models.task import ProjectPlan, Task
 from agents.ceo.agent import CEOAgent
+from agents.ceo import agent as ceo_mod
 
 
 # ========== P0 #5 修复测试 ==========
@@ -18,9 +19,7 @@ def _make_ceo_agent() -> CEOAgent:
     agent = CEOAgent.__new__(CEOAgent)
     agent.agent_id = "test-agent-id"
     agent._active_plans = {}
-    agent._current_sender_id = ""
-    agent._current_chat_id = ""
-    agent._current_chat_type = "p2p"
+    # P1 #8 修复：原实例字段改用 contextvars，测试通过 set() 注入
     agent.feishu = MagicMock()
     agent.input_guard = None
     agent.audit_logger = None
@@ -54,7 +53,7 @@ class TestCEOCardCallbackLateralAuth:
         ceo = _make_ceo_agent()
         plan = _make_plan(creator_sender="ou_creator_abc")
         ceo._active_plans["oc_chat_123"] = plan
-        ceo._current_sender_id = "ou_creator_abc"
+        ceo_mod._current_sender_id.set("ou_creator_abc")
 
         # Mock 实际执行和发送
         with patch.object(ceo, "_execute_plan", new=AsyncMock()) as mock_exec, \
@@ -76,7 +75,7 @@ class TestCEOCardCallbackLateralAuth:
         plan = _make_plan(creator_sender="ou_creator_abc")
         ceo._active_plans["oc_chat_123"] = plan
         # 群聊中另一个用户尝试 confirm A 的计划
-        ceo._current_sender_id = "ou_attacker_xyz"
+        ceo_mod._current_sender_id.set("ou_attacker_xyz")
 
         with patch.object(ceo, "_execute_plan", new=AsyncMock()) as mock_exec, \
              patch.object(ceo, "_send_feishu_text", new=AsyncMock()) as mock_send, \
@@ -106,7 +105,7 @@ class TestCEOCardCallbackLateralAuth:
         ceo = _make_ceo_agent()
         plan = _make_plan(creator_sender="ou_creator_abc")
         ceo._active_plans["oc_chat_123"] = plan
-        ceo._current_sender_id = "ou_attacker_xyz"
+        ceo_mod._current_sender_id.set("ou_attacker_xyz")
 
         with patch.object(ceo, "_send_feishu_text", new=AsyncMock()) as mock_send:
             await ceo._handle_card_callback(
@@ -130,7 +129,7 @@ class TestCEOCardCallbackLateralAuth:
         ceo = _make_ceo_agent()
         plan = _make_plan(creator_sender="")  # 空
         ceo._active_plans["oc_chat_123"] = plan
-        ceo._current_sender_id = "ou_anyone"
+        ceo_mod._current_sender_id.set("ou_anyone")
 
         with patch.object(ceo, "_execute_plan", new=AsyncMock()) as mock_exec, \
              patch.object(ceo, "_send_feishu_text", new=AsyncMock()):
@@ -154,7 +153,7 @@ class TestCEOCardCallbackLateralAuth:
         ceo = _make_ceo_agent()
         plan = _make_plan(creator_sender="ou_creator_abc")
         ceo._active_plans["oc_chat_123"] = plan
-        ceo._current_sender_id = ""  # 缺失
+        ceo_mod._current_sender_id.set("")  # 缺失
 
         with patch.object(ceo, "_execute_plan", new=AsyncMock()) as mock_exec, \
              patch.object(ceo, "_send_feishu_text", new=AsyncMock()):
@@ -174,7 +173,7 @@ class TestCEOCardCallbackLateralAuth:
         ceo = _make_ceo_agent()
         plan = _make_plan(creator_sender="ou_creator_abc")
         ceo._active_plans["oc_chat_123"] = plan
-        ceo._current_sender_id = "ou_creator_abc"
+        ceo_mod._current_sender_id.set("ou_creator_abc")
 
         with patch.object(ceo, "_execute_plan", new=AsyncMock()) as mock_exec, \
              patch.object(ceo, "_send_feishu_text", new=AsyncMock()) as mock_send:

@@ -44,6 +44,36 @@ class StateManager:
             await self.connect()
         await self.redis.delete(key)
 
+    async def dedup_check(
+        self,
+        key: str,
+        ttl: int = 86400,
+    ) -> bool:
+        """P1 #15：原子去重检查（防重放）
+
+        使用 Redis SET key value NX EX ttl 原子操作：
+          - key 不存在 → 设置成功，返回 True（首次出现）
+          - key 已存在 → 设置失败，返回 False（重复）
+
+        Args:
+            key: 去重 key（通常是 message_id）
+            ttl: key 过期时间（秒），默认 24 小时
+
+        Returns:
+            True = 首次出现（应处理）
+            False = 重复（应跳过）
+
+        Note: 比内存 set 可靠：
+          - 跨进程/跨实例生效
+          - 进程重启后仍生效
+          - Redis 单线程保证原子性，无需加锁
+        """
+        if not self.redis:
+            await self.connect()
+        # SET ... NX EX 是原子操作
+        result = await self.redis.set(f"dedup:{key}", "1", nx=True, ex=ttl)
+        return bool(result)
+
     async def exists(self, key: str) -> bool:
         """检查 key 是否存在"""
         if not self.redis:

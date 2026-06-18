@@ -427,26 +427,86 @@ class DevOpsAgent(BaseAgent):
 
     # ========== 辅助方法 ==========
 
+    # P1 #11 修复：项目路径白名单
+    # 攻击场景：LLM 被 prompt 注入后输出 {"client_dir": "/etc"} → 触发 docker build /etc
+    # 修复：所有 client_dir 必须落在 /root/<safe_name>/ 下
+    # 注：可通过环境变量 MUZHU_PROJECT_BASE 覆盖（用于测试环境）
+    import os as _os
+    _ALLOWED_PROJECT_DIR_PREFIX = _os.environ.get("MUZHU_PROJECT_BASE", "/root/")
+
+    @classmethod
+    def _validate_project_dir(cls, raw_dir: str, safe_name: str) -> str:
+        """校验项目路径合法（白名单 + 符号链接解析）
+
+        Args:
+            raw_dir: 待校验的路径
+            safe_name: 已清理的客户名（用于构造白名单路径）
+
+        Returns:
+            校验通过的真实路径
+
+        Raises:
+            ValueError: 路径不安全
+        """
+        import os
+
+        if not raw_dir or not isinstance(raw_dir, str):
+            raise ValueError(f"[Security] 项目目录为空")
+
+        # 解析符号链接和相对路径
+        try:
+            real_path = os.path.realpath(raw_dir)
+        except Exception as e:
+            raise ValueError(f"[Security] 路径解析失败: {e}")
+
+        # 白名单检查：必须落在 <BASE>/<safe_name>/ 下
+        allowed_prefix = os.path.join(cls._ALLOWED_PROJECT_DIR_PREFIX, safe_name)
+        allowed_prefix_real = os.path.realpath(allowed_prefix)
+        if not real_path.startswith(allowed_prefix_real + os.sep) and real_path != allowed_prefix_real:
+            raise ValueError(
+                f"[Security] 项目目录不在白名单: {raw_dir} (解析为 {real_path}) "
+                f"必须在 {allowed_prefix_real} 下"
+            )
+
+        return real_path
+
     def _extract_project_dir(self, message: Message) -> Optional[str]:
-        """从消息中提取项目目录"""
+        """从消息中提取项目目录
+
+        P1 #11：必须配合 _validate_project_dir 校验，client_dir 来自 LLM 不可信
+        """
         # 优先从 metadata 获取
+        raw_dir = None
         if "client_dir" in message.metadata:
-            return message.metadata["client_dir"]
+            raw_dir = message.metadata["client_dir"]
 
-        # 从内容中提取
-        content = message.content
-        import re
-        patterns = [
-            r"项目目录[：:]\s*(\S+)",
-            r"目录[：:]\s*(\S+)",
-            r"client_dir[：:]\s*(\S+)",
-        ]
-        for pattern in patterns:
-            match = re.search(pattern, content)
-            if match:
-                return match.group(1)
+        # 从内容中提取（fallback）
+        if not raw_dir:
+            content = message.content
+            import re
+            patterns = [
+                r"项目目录[：:]\s*(\S+)",
+                r"目录[：:]\s*(\S+)",
+                r"client_dir[：:]\s*(\S+)",
+            ]
+            for pattern in patterns:
+                match = re.search(pattern, content)
+                if match:
+                    raw_dir = match.group(1)
+                    break
 
-        return None
+        if not raw_dir:
+            return None
+
+        # P1 #11 修复：必须校验白名单。这里先取 client_name，再用 _validate_project_dir
+        client_name = self._extract_client_name(message)
+        safe_name = self._generate_service_name(client_name)
+
+        try:
+            return self._validate_project_dir(raw_dir, safe_name)
+        except ValueError as e:
+            logger.error(f"[Security] 拒绝可疑项目目录: {e}")
+            return None  # 返回 None 让上层报错
 
     def _extract_client_name(self, message: Message) -> str:
         """从消息中提取客户名称"""

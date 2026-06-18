@@ -10,6 +10,7 @@ import asyncio
 import hmac
 import json
 import logging
+import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -59,15 +60,15 @@ logger = logging.getLogger(__name__)
 
 # ========== 全局组件 ==========
 
-# 消息总线
-message_bus = MessageBus()
+# 存储（先初始化 state_manager，MessageBus 注入需要它）
+state_manager = StateManager()
+database = Database()
+
+# 消息总线（P1 #9 修复：注入 state_manager 做 Redis 持久化）
+message_bus = MessageBus(state_manager=state_manager)
 
 # LLM 路由器
 llm_router = LLMRouter()
-
-# 存储
-state_manager = StateManager()
-database = Database()
 
 # 记忆系统（三层架构：WorkingMemory + SessionMemory + KnowledgeMemory）
 session_memory: SessionMemory = None
@@ -265,8 +266,9 @@ async def lifespan(app: FastAPI):
         chat_id = data.get("open_chat_id", "")
 
         if value and chat_id:
-            # 生成唯一 message_id，避免被去重跳过
-            card_msg_id = f"card_{value.get('action', '')}_{value.get('plan_id', '')}_{int(asyncio.get_event_loop().time())}"
+            # P1 #10 修复：使用 uuid 而非 time() 生成唯一 message_id
+            # 旧版 int(time()) 在毫秒内多次调用会撞车，且 get_event_loop() 在 3.10+ deprecated
+            card_msg_id = f"card_{value.get('action', '')}_{value.get('plan_id', '')}_{uuid.uuid4().hex[:12]}"
             logger.info(f"卡片回调转发给 CEO: action={value.get('action')}")
             asyncio.run_coroutine_threadsafe(
                 ceo.handle_feishu_message(
@@ -420,6 +422,27 @@ async def security_headers_middleware(request: Request, call_next):
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["Strict-Transport-Security"] = "max-age=31536000"
     return response
+
+
+# Body 大小限制中间件（P1 #14 修复）
+# webhook 端点容易被大 body 攻击（slowapi 只按请求数限流）
+MAX_BODY_SIZE = 5 * 1024 * 1024  # 5 MB
+
+@app.middleware("http")
+async def body_size_limit_middleware(request: Request, call_next):
+    """拒绝超过 MAX_BODY_SIZE 的请求体，防 DoS"""
+    if request.method in ("POST", "PUT", "PATCH"):
+        content_length = request.headers.get("content-length")
+        if content_length:
+            try:
+                if int(content_length) > MAX_BODY_SIZE:
+                    return JSONResponse(
+                        status_code=413,
+                        content={"error": "Request body too large", "max_bytes": MAX_BODY_SIZE},
+                    )
+            except ValueError:
+                pass
+    return await call_next(request)
 
 
 # ========== API 路由 ==========
@@ -793,14 +816,30 @@ async def wecom_ceo_callback(request: Request):
     if not content:
         return {"error": "Empty message"}
 
-    # 消息去重
-    if msg_id in _ceo_processed_messages:
-        logger.info(f"CEO 重复消息，跳过: msg_id={msg_id}")
-        return {"code": 0}
-    _ceo_processed_messages.add(msg_id)
-    # 限制去重集合大小
-    if len(_ceo_processed_messages) > 1000:
-        _ceo_processed_messages = set(list(_ceo_processed_messages)[-500:])
+    # 消息去重（P1 #15 修复：使用 Redis SETNX 替代内存 set）
+    # 旧版内存 set 在并发不安全 + 重启丢失 + 多实例不一致
+    # Redis SETNX 原子操作，跨进程生效，TTL 24h 自动清理
+    if state_manager:
+        try:
+            is_first = await state_manager.dedup_check(f"wecom_ceo:{msg_id}", ttl=86400)
+            if not is_first:
+                logger.info(f"CEO 重复消息，跳过: msg_id={msg_id}")
+                return {"code": 0}
+        except Exception as e:
+            logger.warning(f"Redis 去重检查失败，回退到内存 set: {e}")
+            # 降级：使用内存 set（保留旧行为）
+            if msg_id in _ceo_processed_messages:
+                logger.info(f"CEO 重复消息（降级模式），跳过: msg_id={msg_id}")
+                return {"code": 0}
+            _ceo_processed_messages.add(msg_id)
+            if len(_ceo_processed_messages) > 1000:
+                _ceo_processed_messages = set(list(_ceo_processed_messages)[-500:])
+    else:
+        # state_manager 未初始化时的兼容路径
+        if msg_id in _ceo_processed_messages:
+            logger.info(f"CEO 重复消息（无 state_manager），跳过: msg_id={msg_id}")
+            return {"code": 0}
+        _ceo_processed_messages.add(msg_id)
 
     logger.info(f"企业微信 CEO 收到消息: from={from_user}, content={content[:50]}...")
 
