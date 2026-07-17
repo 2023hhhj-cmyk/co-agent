@@ -11,7 +11,16 @@ Docker 工具封装 - 管理容器生命周期
 import asyncio
 import logging
 import socket
+import time
 from typing import Optional
+
+try:
+    from analytics import emit_event, hash_args  # 埋点（agent 简历数据采集）
+except Exception:  # noqa: BLE001
+    def emit_event(*_a, **_kw):  # type: ignore[no-redef]
+        return None
+    def hash_args(_a):  # type: ignore[no-redef]
+        return ""
 
 from models.deploy import ServiceStatus
 
@@ -138,17 +147,32 @@ class DockerManager:
         Returns:
             bool: 是否成功
         """
-        logger.info(f"构建镜像: {image_name}，目录: {context_dir}")
+        _args_hash = hash_args({"image": image_name, "dir": context_dir})
+        emit_event("tool.call", tool_name="docker.build", phase="start", tool_args_hash=_args_hash)
+        _start = time.time()
+        try:
+            logger.info(f"构建镜像: {image_name}，目录: {context_dir}")
 
-        cmd = ["docker", "build", "-t", image_name, context_dir]
-        result = await self._run_command(cmd)
+            cmd = ["docker", "build", "-t", image_name, context_dir]
+            result = await self._run_command(cmd)
 
-        if result.returncode == 0:
-            logger.info(f"镜像构建成功: {image_name}")
-            return True
-        else:
-            logger.error(f"镜像构建失败: {result.stderr}")
-            return False
+            _ok = result.returncode == 0
+            emit_event("tool.call", tool_name="docker.build", phase="end",
+                       exit_code=result.returncode,
+                       stdout_len=len(result.stdout or ""),
+                       duration_ms=int((time.time() - _start) * 1000),
+                       success=_ok)
+
+            if _ok:
+                logger.info(f"镜像构建成功: {image_name}")
+                return True
+            else:
+                logger.error(f"镜像构建失败: {result.stderr}")
+                return False
+        except Exception:
+            emit_event("tool.call", tool_name="docker.build", phase="end",
+                       duration_ms=int((time.time() - _start) * 1000), success=False)
+            raise
 
     async def run(
         self,
@@ -171,34 +195,49 @@ class DockerManager:
         Returns:
             bool: 是否成功
         """
-        logger.info(f"运行容器: {container_name}，端口: {port}->{internal_port}")
+        _args_hash = hash_args({"name": container_name, "image": image_name, "port": port})
+        emit_event("tool.call", tool_name="docker.run", phase="start", tool_args_hash=_args_hash)
+        _start = time.time()
+        try:
+            logger.info(f"运行容器: {container_name}，端口: {port}->{internal_port}")
 
-        # 先停止同名容器（如果存在）
-        await self.stop(container_name)
-        await self.remove(container_name)
+            # 先停止同名容器（如果存在）
+            await self.stop(container_name)
+            await self.remove(container_name)
 
-        cmd = [
-            "docker", "run", "-d",
-            "--name", container_name,
-            "--restart", "unless-stopped",
-            "-p", f"{port}:{internal_port}",
-        ]
+            cmd = [
+                "docker", "run", "-d",
+                "--name", container_name,
+                "--restart", "unless-stopped",
+                "-p", f"{port}:{internal_port}",
+            ]
 
-        # 添加环境变量
-        if env:
-            for key, value in env.items():
-                cmd.extend(["-e", f"{key}={value}"])
+            # 添加环境变量
+            if env:
+                for key, value in env.items():
+                    cmd.extend(["-e", f"{key}={value}"])
 
-        cmd.append(image_name)
+            cmd.append(image_name)
 
-        result = await self._run_command(cmd)
+            result = await self._run_command(cmd)
 
-        if result.returncode == 0:
-            logger.info(f"容器运行成功: {container_name}")
-            return True
-        else:
-            logger.error(f"容器运行失败: {result.stderr}")
-            return False
+            _ok = result.returncode == 0
+            emit_event("tool.call", tool_name="docker.run", phase="end",
+                       exit_code=result.returncode,
+                       stdout_len=len(result.stdout or ""),
+                       duration_ms=int((time.time() - _start) * 1000),
+                       success=_ok)
+
+            if _ok:
+                logger.info(f"容器运行成功: {container_name}")
+                return True
+            else:
+                logger.error(f"容器运行失败: {result.stderr}")
+                return False
+        except Exception:
+            emit_event("tool.call", tool_name="docker.run", phase="end",
+                       duration_ms=int((time.time() - _start) * 1000), success=False)
+            raise
 
     async def stop(self, container_name: str) -> bool:
         """

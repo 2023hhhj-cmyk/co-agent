@@ -23,6 +23,12 @@ from memory.knowledge import KnowledgeMemory
 from memory.session import SessionMemory
 from memory.working import WorkingMemory
 
+try:
+    from analytics import emit_event  # 埋点（agent 简历数据采集）
+except Exception:  # noqa: BLE001
+    def emit_event(*_a, **_kw):  # type: ignore[no-redef]
+        return None
+
 logger = logging.getLogger(__name__)
 
 
@@ -348,6 +354,8 @@ class MemoryManager:
         Returns:
             去重后的 MemoryItem 列表
         """
+        import time as _t
+        _recall_start = _t.time()
         results: List[MemoryItem] = []
 
         # Layer 1: 短期记忆（总是全量返回）
@@ -472,7 +480,12 @@ class MemoryManager:
             # recent: pure time
             results.sort(key=lambda x: x.created_at, reverse=True)
 
-        return results[:top_k * 3]
+        final = results[:top_k * 3]
+        # 埋点：memory.recall
+        emit_event("memory.recall", memory_type=strategy, items_count=len(final),
+                   hit=len(final) > 0,
+                   duration_ms=int((_t.time() - _recall_start) * 1000))
+        return final
 
     # ========== 删除 ==========
 

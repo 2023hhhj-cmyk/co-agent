@@ -25,6 +25,7 @@ from typing import Any, Optional
 import yaml
 
 from agents.base import BaseAgent
+from analytics import emit_event, hash_id
 from channels.feishu import FeishuClient
 from models.agent import ActionDef, AgentRole, ReactMode
 from models.message import Message
@@ -186,6 +187,9 @@ class CEOAgent(BaseAgent):
         _current_chat_id.set(chat_id)
         _current_sender_id.set(sender_id)
         _current_chat_type.set(chat_type)
+
+        # 埋点：feishu.message.received（去重后）
+        emit_event("feishu.message.received", user_id_hash=hash_id(sender_id), msg_len=len(text))
 
         logger.info(f"CEO 收到飞书消息: chat_id={chat_id}, text={text[:50]}...")
 

@@ -2,9 +2,10 @@
 配置设置
 """
 import os
-from pydantic_settings import BaseSettings
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore", case_sensitive=True)  # ponytail: 忽略未声明 env vars（Claude Code CLI 的 ANTHROPIC_* 不污染 Settings）
     HOST: str = "0.0.0.0"
     PORT: int = 8080
     DATABASE_URL: str = ""
@@ -47,8 +48,6 @@ class Settings(BaseSettings):
     CS_QUEUE_BATCH_SIZE: int = 5       # 每批处理数
     CS_QUEUE_INTERVAL: float = 1.0     # 批次间隔（秒）
 
-    class Config:
-        env_file = ".env"
-        case_sensitive = True
+    # ponytail: 配置走 model_config（旧的 class Config 已合并到 model_config 上面）
 
 settings = Settings()

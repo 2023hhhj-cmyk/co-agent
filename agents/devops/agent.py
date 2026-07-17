@@ -14,7 +14,9 @@
 """
 
 import asyncio
+import glob
 import logging
+import os
 from datetime import datetime
 from typing import Any, Optional
 
@@ -60,7 +62,7 @@ DEVOPS_ROLE = AgentRole(
             prompt_template="请生成运维报告",
         ),
     ],
-    watch={"review_code", "deploy_request", "deploy_fix"},
+    watch={"review_code", "deploy_request", "deploy_fix", "ceo_task_assignment"},
     react_mode=ReactMode.REACT,
     max_react_loop=3,
 )
@@ -76,6 +78,7 @@ class DevOpsAgent(BaseAgent):
         base_dir: str = "/root",
         **kwargs,
     ):
+        logger.info("DEBUG DevOpsAgent __init__ CALLED")
         super().__init__(
             role=DEVOPS_ROLE,
             llm_client=llm_client,
@@ -121,17 +124,18 @@ class DevOpsAgent(BaseAgent):
 
     async def _think(self, messages: list[Message]) -> Optional[ActionDef]:
         """思考阶段"""
+        logger.info(f"DEBUG devops._think called with {len(messages)} messages")
         if not messages:
             return None
 
         last_message = messages[-1]
+        logger.info(f"DEBUG devops._think last_message.cause_by={last_message.cause_by if last_message else None}")
 
-        if last_message.cause_by in ("review_code", "deploy_request"):
-            return self.role.get_action_by_name("deploy")
-        elif last_message.cause_by == "deploy_fix":
+        if last_message.cause_by == "deploy_fix":
             return self.role.get_action_by_name("fix")
 
-        return None
+        # ponytail: 任何收到消息都尝试部署（plan 触发 / review_code 触发 / deploy_request 触发都走 deploy）
+        return self.role.get_action_by_name("deploy")
 
     async def _act(self, action: ActionDef, context: dict[str, Any] = None) -> Message:
         """执行阶段"""
@@ -180,11 +184,51 @@ class DevOpsAgent(BaseAgent):
         client_name = self._extract_client_name(last_message)
 
         if not project_dir:
-            return Message(
-                content="无法解析项目目录",
-                cause_by="error",
-                sent_from=self.agent_id,
-            )
+            # ponytail: plan 触发场景下 last_message 没 client_dir，主动扫描 /root/client_*/
+            logger.info("_extract_project_dir 返 None，尝试扫描 /root/client_*/")
+            try:
+                candidates = [
+                    (d, os.path.join(d, "index.html"))
+                    for d in glob.glob("/root/client_*")
+                    if os.path.isdir(d) and os.path.exists(os.path.join(d, "index.html"))
+                ]
+                if candidates:
+                    candidates.sort(key=lambda x: os.path.getmtime(x[1]), reverse=True)
+                    project_dir = candidates[0][0]
+                    client_name = os.path.basename(project_dir)
+                    service_name = self._generate_service_name(client_name)
+                    logger.info(f"自动发现 client_dir: {project_dir}")
+            except Exception as e:
+                logger.warning(f"扫描失败: {e}")
+            if not project_dir:
+                return Message(
+                    content="无法解析项目目录",
+                    cause_by="error",
+                    sent_from=self.agent_id,
+                )
+
+        # ponytail: 快速静态部署路径——跳过 Docker，client_dir 里有 index.html 就直接 nginx 托管
+        index_html = os.path.join(project_dir, "index.html")
+        if not os.path.exists(index_html):
+            # ponytail: 找不到 index.html 时扫描 /root/client_*/ 取最新的（plan 触发场景）
+            try:
+                candidates = [
+                    (d, os.path.join(d, "index.html"))
+                    for d in glob.glob("/root/client_*")
+                    if os.path.isdir(d) and os.path.exists(os.path.join(d, "index.html"))
+                ]
+                if candidates:
+                    candidates.sort(key=lambda x: os.path.getmtime(x[1]), reverse=True)
+                    project_dir = candidates[0][0]
+                    client_name = os.path.basename(project_dir)
+                    service_name = self._generate_service_name(client_name)
+                    index_html = os.path.join(project_dir, "index.html")
+                    logger.info(f"自动发现 client_dir: {project_dir}")
+            except Exception as e:
+                logger.warning(f"扫描 /root/client_*/ 失败: {e}")
+
+        if os.path.exists(index_html):
+            return await self._static_deploy(project_dir, client_name, service_name)
 
         # 生成服务名称
         service_name = self._generate_service_name(client_name)
@@ -315,6 +359,182 @@ class DevOpsAgent(BaseAgent):
                     "status": "failed",
                 },
             )
+
+    async def _static_deploy(
+        self, project_dir: str, client_name: str, service_name: str
+    ) -> Message:
+        """ponytail: 智能部署——根据项目类型自动选 Node/Python/纯静态。"""
+        from pathlib import Path
+        project = Path(project_dir)
+        if (project / "package.json").exists():
+            return await self._deploy_node_project(project_dir, client_name, service_name)
+        elif (project / "requirements.txt").exists() or (project / "pyproject.toml").exists():
+            return await self._deploy_python_project(project_dir, client_name, service_name)
+        else:
+            return await self._deploy_static(project_dir, client_name, service_name)
+
+    async def _deploy_node_project(
+        self, project_dir: str, client_name: str, service_name: str
+    ) -> Message:
+        """ponytail: Node/Vue/React 项目：npm install + build + 部署 dist/。"""
+        import subprocess
+        safe_name = self._sanitize_name(service_name)
+        site_root = f"/var/www/muzhu-ai/{safe_name}"
+
+        async def _run(cmd, timeout=300):
+            proc = await asyncio.create_subprocess_exec(
+                *cmd, cwd=project_dir, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+            )
+            try:
+                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+            except asyncio.TimeoutError:
+                proc.kill()
+                return False, "", f"timeout after {timeout}s"
+            return proc.returncode == 0, stdout.decode("utf-8", errors="replace"), stderr.decode("utf-8", errors="replace")
+
+        ok, _, err = await _run(["npm", "install", "--prefer-offline", "--no-audit", "--no-fund"], timeout=300)
+        if not ok:
+            return Message(content=f"npm install 失败:\n{err[:500]}", cause_by="deploy_failed", sent_from=self.agent_id)
+
+        ok, stdout, err = await _run(["npm", "run", "build"], timeout=300)
+        if not ok:
+            return Message(content=f"npm run build 失败:\n{stdout[-300:]}\n{err[-500:]}", cause_by="deploy_failed", sent_from=self.agent_id)
+
+        # 找 build 输出目录
+        dist_dir = None
+        for candidate in ["dist", "build", "public", ".next", "out"]:
+            p = os.path.join(project_dir, candidate)
+            if os.path.isdir(p):
+                dist_dir = p
+                break
+        if not dist_dir:
+            return Message(content="build 完成但找不到 dist/ build/ public/ .next/ out/ 任何输出目录", cause_by="deploy_failed", sent_from=self.agent_id)
+
+        # 复制 dist/ 到 nginx 目录
+        import shutil
+        if os.path.exists(site_root):
+            shutil.rmtree(site_root)
+        shutil.copytree(dist_dir, site_root)
+
+        # 写 nginx + reload
+        self._add_nginx_location(safe_name, site_root)
+        status = self._reload_nginx()
+        return Message(
+            content=f"[Node 项目部署完成] {status}\n源: {project_dir}\n产物: {dist_dir}\n目标: {site_root}\nURL: https://47.82.5.164/{safe_name}/",
+            cause_by="deploy_complete", sent_from=self.agent_id,
+            metadata={"action": "deploy_node", "service_name": service_name, "site_url": f"https://47.82.5.164/{safe_name}/", "site_root": site_root},
+        )
+
+    async def _deploy_python_project(
+        self, project_dir: str, client_name: str, service_name: str
+    ) -> Message:
+        """ponytail: Python 项目：跳过（v3 暂不实现完整 Python 部署）。"""
+        return Message(
+            content="Python 项目部署暂未实现，请手动部署或先用 _deploy_static 路径。",
+            cause_by="deploy_skipped", sent_from=self.agent_id,
+        )
+
+    def _add_nginx_location(self, safe_name: str, site_root: str) -> None:
+        """ponytail: 写 location 块到现有 loveboos-ai.conf 的 marker 后。"""
+        nginx_conf = "/etc/nginx/conf.d/loveboos-ai.conf"
+        # 删旧的同 safe_name 块
+        with open(nginx_conf) as f:
+            content = f.read()
+        content = re.sub(
+            rf"    # auto-deploy: {re.escape(safe_name)}\n    location[^{{]*\{{[^}}]*}}\n",
+            "", content,
+        )
+        location_block = (
+            f"    # auto-deploy: {safe_name}\n"
+            f"    location /{safe_name} {{\n"
+            f"        alias {site_root};\n"
+            f"        index index.html;\n"
+            f"        try_files $uri $uri/ =404;\n"
+            f"    }}\n"
+        )
+        m = "    # 服务配置将自动添加到此处\n"
+        if m in content:
+            content = content.replace(m, m + location_block)
+        else:
+            content += location_block
+        with open(nginx_conf, "w") as f:
+            f.write(content)
+
+    def _reload_nginx(self) -> str:
+        """ponytail: nginx -t + reload。"""
+        import subprocess
+        try:
+            subprocess.run(["nginx", "-t"], check=True, capture_output=True, timeout=10)
+            subprocess.run(["systemctl", "reload", "nginx"], check=True, capture_output=True, timeout=10)
+            return "nginx reload 成功"
+        except subprocess.CalledProcessError as e:
+            err = e.stderr.decode() if e.stderr else str(e)
+            return f"nginx reload 失败: {err[:300]}"
+
+    async def _deploy_static(
+        self, project_dir: str, client_name: str, service_name: str
+    ) -> Message:
+        """
+        ponytail: 快速静态部署——跳过 Docker，直接 nginx 静态托管。
+        用于 client_dir 里已经有 index.html 的场景（fallback LLM 已生成）。
+        """
+        import shutil
+        import subprocess
+
+        # 目标路径：/var/www/muzhu-ai/{service_name}
+        safe_name = self._sanitize_name(service_name)
+        site_root = f"/var/www/muzhu-ai/{safe_name}"
+        os.makedirs(site_root, exist_ok=True)
+
+        # 复制 index.html + 任何附属文件
+        for fname in os.listdir(project_dir):
+            src = os.path.join(project_dir, fname)
+            dst = os.path.join(site_root, fname)
+            if os.path.isfile(src):
+                shutil.copy2(src, dst)
+
+        # 写 nginx location 块——追加到 loveboos-ai.conf 的 server 块（conf.d 不支持裸 location）
+        nginx_conf = "/etc/nginx/conf.d/loveboos-ai.conf"
+        location_block = (
+            f"    # auto-deploy: {safe_name}\n"
+            f"    location /{safe_name} {{\n"
+            f"        alias {site_root};\n"
+            f"        index index.html;\n"
+            f"        try_files $uri $uri/ =404;\n"
+            f"    }}\n"
+        )
+        with open(nginx_conf, "a") as f:
+            f.write(location_block)
+
+        # reload nginx
+        try:
+            subprocess.run(
+                ["nginx", "-t"], check=True, capture_output=True, timeout=10
+            )
+            subprocess.run(
+                ["systemctl", "reload", "nginx"], check=True, capture_output=True, timeout=10
+            )
+            status_msg = f"已部署到 https://muzhu-ai.com/{safe_name}/"
+        except subprocess.CalledProcessError as e:
+            status_msg = f"nginx reload 失败: {e.stderr.decode() if e.stderr else e}"
+
+        return Message(
+            content=f"[静态部署完成] {status_msg}\n源: {project_dir}\n目标: {site_root}",
+            cause_by="deploy_complete",
+            sent_from=self.agent_id,
+            metadata={
+                "action": "static_deploy",
+                "service_name": service_name,
+                "site_url": f"https://muzhu-ai.com/{safe_name}/",
+                "site_root": site_root,
+            },
+        )
+
+    def _sanitize_name(self, name: str) -> str:
+        """清理名称做 URL 段。"""
+        import re
+        s = re.sub(r"[^a-zA-Z0-9_-]+", "-", (name or "site").lower()).strip("-")
+        return s or "site"
 
     async def _monitor(self, last_message: Optional[Message]) -> Message:
         """监控服务状态"""

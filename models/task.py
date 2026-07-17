@@ -25,6 +25,63 @@ class TaskStatus(str, Enum):
     WAITING_DEP = "waiting_dep"    # 等待依赖完成
 
 
+class SubTaskStatus(str, Enum):
+    """ponytail: 子任务状态机（v3 设计）。"""
+    PENDING = "pending"      # 等待依赖
+    READY = "ready"          # 依赖齐了，可跑
+    RUNNING = "running"      # 跑中
+    RETRYING = "retrying"    # 重试中
+    SUCCESS = "success"      # 成功
+    FAILED = "failed"        # 失败（重试完）
+    SKIPPED = "skipped"      # 依赖失败 → 跳过
+
+    @classmethod
+    def can_transition(cls, src: "SubTaskStatus", dst: "SubTaskStatus") -> bool:
+        """ponytail: 合法状态转移校验。"""
+        valid = {
+            cls.PENDING: {cls.READY, cls.SKIPPED},
+            cls.READY: {cls.RUNNING, cls.SKIPPED},
+            cls.RUNNING: {cls.SUCCESS, cls.FAILED, cls.RETRYING},
+            cls.RETRYING: {cls.RUNNING, cls.FAILED},
+            cls.SUCCESS: set(),
+            cls.FAILED: set(),
+            cls.SKIPPED: set(),
+        }
+        return dst in valid.get(src, set())
+
+
+class SubTask:
+    """ponytail: 一个可独立调 Claude Code 执行的子任务。"""
+
+    __slots__ = (
+        "name", "desc", "deps", "status", "output_path",
+        "duration_ms", "error", "start_time", "retries",
+    )
+
+    def __init__(self, name: str, desc: str, deps: Optional[list] = None):
+        self.name = name
+        self.desc = desc
+        self.deps = deps or []
+        self.status = SubTaskStatus.PENDING
+        self.output_path: Optional[str] = None
+        self.duration_ms: int = 0
+        self.error: Optional[str] = None
+        self.start_time: float = 0.0
+        self.retries: int = 0
+
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "desc": self.desc,
+            "deps": list(self.deps),
+            "status": self.status.value,
+            "output_path": self.output_path,
+            "duration_ms": self.duration_ms,
+            "error": self.error,
+            "retries": self.retries,
+        }
+
+
 class Task(BaseModel):
     """单个子任务"""
     id: str = Field(default_factory=lambda: uuid.uuid4().hex[:8])

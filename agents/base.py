@@ -16,6 +16,7 @@ from abc import ABC, abstractmethod
 from datetime import datetime
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
+from analytics import emit_event, hash_args, hash_id
 from models.agent import ActionDef, AgentRole, ReactMode
 from models.message import Message, MessageQueue
 from observability.metrics import (
@@ -26,6 +27,27 @@ from observability.metrics import (
 )
 from tools.llm.client import LLMClient
 from tools.llm.prompt import PromptManager
+
+
+def _classify_error(e: Exception) -> str:
+    """把异常归到 8 个 error_code 枚举之一。"""
+    name = type(e).__name__.lower()
+    msg = str(e).lower()
+    if "timeout" in msg or "timeout" in name:
+        return "llm_timeout"
+    if "json" in msg and ("parse" in msg or "decode" in msg):
+        return "llm_json_parse_fail"
+    if "sandbox" in msg and "degraded" in msg:
+        return "sandbox_degraded"
+    if "too long" in msg or "length" in msg or "too_long" in msg:
+        return "input_too_long"
+    if "cycle" in msg:
+        return "workflow_cycle_detected"
+    if "max" in msg and "step" in msg:
+        return "agent_max_steps_exceeded"
+    if "exit" in msg and "code" in msg:
+        return "tool_exit_nonzero"
+    return "unknown"
 
 if TYPE_CHECKING:
     from memory.manager import MemoryManager
@@ -150,6 +172,101 @@ class BaseAgent(ABC):
 
         return messages
 
+    # ========== 自动分块生成（防 LLM 输出截断） ==========
+
+    def _estimate_tokens(self, text: str) -> int:
+        """ponytail: 估算 token 数 + 预估输出。中文 1 字 ≈ 1.5 token，输出按输入 × 4。"""
+        chinese = sum(1 for c in text if "一" <= c <= "鿿")
+        ascii_words = len(text.split()) - chinese
+        input_tokens = int(chinese * 1.5 + ascii_words * 1.3)
+        # ponytail: 输出预估 = 输入 × 4（生成任务输出远大于输入）
+        return input_tokens * 4
+
+    async def _smart_generate(
+        self, system: str, user: str, max_tokens: int = 8000, temperature: float = 0.5
+    ) -> str:
+        """
+        ponytail: 自动判断是否需要分块生成。
+        - 小任务：单次 LLM 调用
+        - 大任务：先调 LLM 拆子任务，再分别生成，最后合并
+        """
+        if not self.llm:
+            raise RuntimeError("LLM not configured")
+
+        full_prompt = f"{system}\n\n{user}"
+        estimated = self._estimate_tokens(full_prompt)
+        # ponytail: 阈值是 max_tokens / 4 —— 大多数生成任务输入 600 token 就要 4× 输出
+        chunk_threshold = max_tokens // 4
+        logger.info(f"DEBUG _smart_generate: estimated={estimated} threshold={chunk_threshold}")
+        if estimated <= chunk_threshold:
+            logger.info("DEBUG _smart_generate: 单次调用（小任务）")
+            return await self.llm.chat(
+                [{"role": "system", "content": system}, {"role": "user", "content": user}],
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+        logger.info("DEBUG _smart_generate: 走分块路径（大任务）")
+
+        # 大任务：拆分 + 增量生成
+        import json
+        decompose_prompt = (
+            f"把以下任务拆成若干子任务，每个子任务的目标输出 ≤ {max_tokens} token。\n"
+            f"输出严格 JSON 数组，每个元素形如 {{\"name\": \"<短名>\", \"desc\": \"<子任务描述>\"}}：\n\n"
+            f"{user}"
+        )
+        try:
+            decomp_raw = await self.llm.chat(
+                [{"role": "user", "content": decompose_prompt}],
+                temperature=0.3,
+                max_tokens=500,
+            )
+            # ponytail: 容忍 markdown code fence 包裹
+            decomp_raw = decomp_raw.strip()
+            if decomp_raw.startswith("```"):
+                decomp_raw = decomp_raw.split("\n", 1)[1].rsplit("```", 1)[0]
+            sub_tasks = json.loads(decomp_raw)
+        except Exception as e:
+            # ponytail: 拆不动就降级——单次调用 + 提醒调用方可能截断
+            logger.warning(f"任务拆解失败: {e}，降级单次调用")
+            return await self.llm.chat(
+                [{"role": "system", "content": system}, {"role": "user", "content": user}],
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+
+        # 第一步：生成骨架（含占位 `<!-- @module: name -->`）
+        skeleton_prompt = (
+            f"生成 HTML/代码骨架（head + 整体结构 + 各个 section 的占位）。\n"
+            f"每个 section 用占位 `<!-- @module: <name> -->` 标记，便于后续填充。\n"
+            f"目标输出 ≤ {max_tokens} token。\n\n任务：\n{user}"
+        )
+        skeleton = await self.llm.chat(
+            [{"role": "system", "content": system}, {"role": "user", "content": skeleton_prompt}],
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+
+        # 后续：每个子任务填一个 section
+        for sub in sub_tasks:
+            placeholder = f"<!-- @module: {sub['name']} -->"
+            if placeholder not in skeleton:
+                logger.warning(f"骨架里没找到 {placeholder}，跳过")
+                continue
+            chunk_prompt = (
+                f"只输出这一个 section 的源码（不要 head/body 标签）。\n"
+                f"对应占位名：`{sub['name']}`\n"
+                f"任务描述：{sub['desc']}\n"
+                f"目标输出 ≤ {max_tokens} token。"
+            )
+            chunk = await self.llm.chat(
+                [{"role": "system", "content": system}, {"role": "user", "content": chunk_prompt}],
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+            skeleton = skeleton.replace(placeholder, chunk)
+
+        return skeleton
+
     @abstractmethod
     async def _think(self, messages: List[Message]) -> Optional[ActionDef]:
         """
@@ -189,12 +306,46 @@ class BaseAgent(ABC):
         - 循环执行 Think-Act
         - 直到没有新动作或达到最大循环次数
         """
+        import time as _t
         result = None
         for _ in range(self.role.max_react_loop):
-            action = await self._think(messages)
+            # 埋点：agent.think start
+            _think_start = _t.time()
+            emit_event("agent.think", agent_role=self.role.name, phase="start")
+            try:
+                action = await self._think(messages)
+                # ponytail: capture LLM token usage (empty on cache hit)
+                _u = self.llm.get_last_usage() if self.llm else {}
+                emit_event("agent.think", agent_role=self.role.name, phase="end",
+                           duration_ms=int((_t.time() - _think_start) * 1000), success=True,
+                           prompt_tokens=_u.get("prompt_tokens", 0),
+                           completion_tokens=_u.get("completion_tokens", 0))
+            except Exception:
+                emit_event("agent.think", agent_role=self.role.name, phase="end",
+                           duration_ms=int((_t.time() - _think_start) * 1000), success=False)
+                raise
             if action is None:
                 break
-            result = await self._act(action)
+
+            # 埋点：agent.act start
+            _act_start = _t.time()
+            emit_event("agent.act", agent_role=self.role.name, phase="start",
+                       action_name=action.name, action_args_hash=hash_args(action.model_dump()))
+            try:
+                # ponytail: 传 messages 让 _act 拿到 last_message（含 PRD 等上下文）
+                result = await self._act(action, context={"messages": messages})
+                # ponytail: capture LLM token usage (empty on cache hit, populated for real calls)
+                _u = self.llm.get_last_usage() if self.llm else {}
+                emit_event("agent.act", agent_role=self.role.name, phase="end",
+                           action_name=action.name,
+                           duration_ms=int((_t.time() - _act_start) * 1000), success=True,
+                           prompt_tokens=_u.get("prompt_tokens", 0),
+                           completion_tokens=_u.get("completion_tokens", 0))
+            except Exception:
+                emit_event("agent.act", agent_role=self.role.name, phase="end",
+                           action_name=action.name,
+                           duration_ms=int((_t.time() - _act_start) * 1000), success=False)
+                raise
             # 将结果加入消息，供下一轮 Think 使用
             messages.append(result)
         return result
@@ -295,6 +446,10 @@ class BaseAgent(ABC):
                 await self.audit_logger.log_task_executed(
                     self.agent_id, str(e)[:200], result="error", duration_ms=0,
                 )
+            # 埋点：agent.error
+            emit_event("agent.error", agent_role=self.role.name,
+                       error_code=_classify_error(e),
+                       error_msg_hash=hash_id(str(e)))
             raise
         finally:
             elapsed = time.time() - task_start

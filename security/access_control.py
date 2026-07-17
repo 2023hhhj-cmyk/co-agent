@@ -62,7 +62,7 @@ ROLE_PERMISSIONS: Dict[str, dict] = {
     },
     "devops": {
         "allowed_watch": {
-            "review_code", "deploy_request", "deploy_fix",
+            "review_code", "deploy_request", "deploy_fix", "ceo_task_assignment",
         },
         "allowed_tools": {"docker", "nginx", "monitoring", "claude_code"},
         "allowed_actions": {

@@ -12,11 +12,20 @@
 import json
 import logging
 import os
+import time
 from dataclasses import dataclass, field
 from typing import Optional
 
 from tools.code.claude_code import ClaudeCodeTool, ClaudeCodeResult
 from tools.deploy.cache import CacheManager
+
+try:
+    from analytics import emit_event, hash_args  # 埋点（agent 简历数据采集）
+except Exception:  # noqa: BLE001
+    def emit_event(*_a, **_kw):  # type: ignore[no-redef]
+        return None
+    def hash_args(_a):  # type: ignore[no-redef]
+        return ""
 
 logger = logging.getLogger(__name__)
 
@@ -64,57 +73,72 @@ class ProjectAnalyzer:
         Returns:
             ProjectInfo: 项目分析结果
         """
-        if not os.path.isdir(project_dir):
-            logger.error(f"项目目录不存在: {project_dir}")
-            return ProjectInfo(
-                project_type="unknown",
-                notes=f"项目目录不存在: {project_dir}",
+        _args_hash = hash_args({"dir": project_dir})
+        emit_event("tool.call", tool_name="analyzer.analyze", phase="start", tool_args_hash=_args_hash)
+        _start = time.time()
+        _ok = False
+        try:
+            if not os.path.isdir(project_dir):
+                logger.error(f"项目目录不存在: {project_dir}")
+                return ProjectInfo(
+                    project_type="unknown",
+                    notes=f"项目目录不存在: {project_dir}",
+                )
+
+            logger.info(f"开始分析项目目录: {project_dir}")
+
+            # 检查缓存
+            if self.use_cache and self.cache:
+                cached = self.cache.get(project_dir)
+                if cached:
+                    logger.info(f"使用缓存结果: {project_dir}")
+                    _ok = True
+                    return ProjectInfo(**cached)
+
+            # 构建任务描述
+            task = self._build_task()
+
+            # 调用 Claude Code 分析
+            result = await self.claude_code.execute(
+                task=task,
+                working_dir=project_dir,
             )
 
-        logger.info(f"开始分析项目目录: {project_dir}")
+            if not result.success:
+                logger.error(f"项目分析失败: {result.error}")
+                return ProjectInfo(
+                    project_type="unknown",
+                    notes=f"分析失败: {result.error}",
+                )
 
-        # 检查缓存
-        if self.use_cache and self.cache:
-            cached = self.cache.get(project_dir)
-            if cached:
-                logger.info(f"使用缓存结果: {project_dir}")
-                return ProjectInfo(**cached)
+            # 解析结果
+            project_info = self._parse_result(result)
+            logger.info(f"项目分析完成: type={project_info.project_type}, tech={project_info.tech_stack}")
+            _ok = True
 
-        # 构建任务描述
-        task = self._build_task()
+            # 保存到缓存
+            if self.use_cache and self.cache and project_info.project_type != "unknown":
+                self.cache.set(project_dir, {
+                    "project_type": project_info.project_type,
+                    "tech_stack": project_info.tech_stack,
+                    "dockerfile_content": project_info.dockerfile_content,
+                    "compose_content": project_info.compose_content,
+                    "health_check_path": project_info.health_check_path,
+                    "notes": project_info.notes,
+                    "entry_point": project_info.entry_point,
+                    "build_command": project_info.build_command,
+                    "start_command": project_info.start_command,
+                })
 
-        # 调用 Claude Code 分析
-        result = await self.claude_code.execute(
-            task=task,
-            working_dir=project_dir,
-        )
-
-        if not result.success:
-            logger.error(f"项目分析失败: {result.error}")
-            return ProjectInfo(
-                project_type="unknown",
-                notes=f"分析失败: {result.error}",
-            )
-
-        # 解析结果
-        project_info = self._parse_result(result)
-        logger.info(f"项目分析完成: type={project_info.project_type}, tech={project_info.tech_stack}")
-
-        # 保存到缓存
-        if self.use_cache and self.cache and project_info.project_type != "unknown":
-            self.cache.set(project_dir, {
-                "project_type": project_info.project_type,
-                "tech_stack": project_info.tech_stack,
-                "dockerfile_content": project_info.dockerfile_content,
-                "compose_content": project_info.compose_content,
-                "health_check_path": project_info.health_check_path,
-                "notes": project_info.notes,
-                "entry_point": project_info.entry_point,
-                "build_command": project_info.build_command,
-                "start_command": project_info.start_command,
-            })
-
-        return project_info
+            return project_info
+        except Exception:
+            emit_event("tool.call", tool_name="analyzer.analyze", phase="end",
+                       duration_ms=int((time.time() - _start) * 1000), success=False)
+            raise
+        finally:
+            if _ok:
+                emit_event("tool.call", tool_name="analyzer.analyze", phase="end",
+                           duration_ms=int((time.time() - _start) * 1000), success=True)
 
     def _build_task(self) -> str:
         """构建分析任务描述（优化版：更简洁，减少输出）"""

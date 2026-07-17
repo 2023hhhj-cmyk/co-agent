@@ -15,8 +15,15 @@ MemoryConsolidator — LLM 驱动的记忆自动提炼器
 import asyncio
 import json
 import logging
+import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional
+
+try:
+    from analytics import emit_event  # 埋点（agent 简历数据采集）
+except Exception:  # noqa: BLE001
+    def emit_event(*_a, **_kw):  # type: ignore[no-redef]
+        return None
 
 logger = logging.getLogger(__name__)
 
@@ -82,6 +89,9 @@ class MemoryConsolidator:
         if not messages:
             return None
 
+        _start = time.time()
+        _items_in = len(messages)
+
         # 构建原始日志文本
         log_lines = []
         for i, msg in enumerate(messages):
@@ -112,10 +122,24 @@ class MemoryConsolidator:
                 max_tokens=500,
             )
 
-            return self._parse_response(response)
+            result = self._parse_response(response)
+            # 埋点：memory.distill（成功）
+            _role = (metadata or {}).get("agent_role", "unknown")
+            _items_out = 0
+            if result:
+                _items_out = sum(
+                    len(v) for v in result.values() if isinstance(v, list)
+                ) or 1
+            emit_event("memory.distill", agent_role=_role, items_in=_items_in, items_out=_items_out,
+                       duration_ms=int((time.time() - _start) * 1000))
+            return result
 
         except Exception as e:
             logger.error(f"LLM 提炼失败: {e}")
+            # 埋点：memory.distill（失败）
+            _role = (metadata or {}).get("agent_role", "unknown")
+            emit_event("memory.distill", agent_role=_role, items_in=_items_in, items_out=0,
+                       duration_ms=int((time.time() - _start) * 1000))
             return None
 
     # ========== 异步非阻塞提炼 ==========

@@ -6,10 +6,13 @@ Claude Code CLI 工具封装
 """
 
 import asyncio
+import json
 import logging
 import os
 from dataclasses import dataclass
 from typing import Any, Optional
+
+from analytics import emit_event, hash_args
 
 logger = logging.getLogger(__name__)
 
@@ -21,6 +24,7 @@ class ClaudeCodeResult:
     output: str
     error: Optional[str] = None
     working_dir: Optional[str] = None
+    tokens: dict = None  # ponytail: minimaxi token 用量（input/output/cache/cost）
 
 
 class ClaudeCodeTool:
@@ -101,11 +105,18 @@ class ClaudeCodeTool:
         if self.sandbox:
             logger.info(f"使用沙箱执行: mode={self.sandbox.mode}")
             sandbox_result = await self.sandbox.execute(task, context, cwd)
+            # ponytail: 沙箱模式下尝试从 stdout 抓 token（如果沙箱内也用 --output-format json）
+            sandbox_tokens = {}
+            if sandbox_result.output:
+                sandbox_tokens = self._parse_token_usage(sandbox_result.output)
+            # ponytail: 工具调用埋点（含 minimaxi token）
+            self._emit_tool_call_event(task, sandbox_result.success, sandbox_tokens)
             return ClaudeCodeResult(
                 success=sandbox_result.success,
                 output=sandbox_result.output,
                 error=sandbox_result.error,
                 working_dir=cwd,
+                tokens=sandbox_tokens,
             )
 
         # 确保工作目录存在
@@ -151,10 +162,21 @@ class ClaudeCodeTool:
 
             if process.returncode == 0:
                 logger.info("Claude Code 任务执行成功")
+                tokens = self._parse_token_usage(stdout_text)
+                if tokens and tokens.get("input_tokens", 0) > 0:
+                    logger.info(
+                        f"minimaxi token: input={tokens['input_tokens']} "
+                        f"output={tokens['output_tokens']} "
+                        f"cache_read={tokens['cache_read_input_tokens']} "
+                        f"cost_usd={tokens['total_cost_usd']:.4f}"
+                    )
+                # ponytail: 工具调用埋点（含 minimaxi token）
+                self._emit_tool_call_event(full_task, True, tokens)
                 return ClaudeCodeResult(
                     success=True,
                     output=stdout_text,
                     working_dir=cwd,
+                    tokens=tokens,
                 )
             else:
                 logger.error(f"Claude Code 执行失败: {stderr_text}")
@@ -234,7 +256,7 @@ class ClaudeCodeTool:
 
     def _build_command(self, task: str) -> list[str]:
         """构建命令参数列表"""
-        cmd = ["claude", "-p", task]
+        cmd = ["claude", "-p", task, "--output-format", "json"]
 
         # 添加允许的工具
         if self.allowed_tools:
@@ -242,6 +264,50 @@ class ClaudeCodeTool:
                 cmd.extend(["--allowed-tools", tool])
 
         return cmd
+
+    def _parse_token_usage(self, stdout_text: str) -> dict:
+        """ponytail: 解析 Claude Code --output-format json 输出，提取 minimaxi token 数据。"""
+        try:
+            data = json.loads(stdout_text)
+            usage = data.get("usage", {})
+            model_usage = data.get("modelUsage", {})
+            tokens = {
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cache_read_input_tokens": 0,
+                "cache_creation_input_tokens": 0,
+                "total_cost_usd": data.get("total_cost_usd", 0.0),
+            }
+            if model_usage:
+                first_model = next(iter(model_usage.values()), {})
+                tokens["input_tokens"] = first_model.get("inputTokens", 0)
+                tokens["output_tokens"] = first_model.get("outputTokens", 0)
+                tokens["cache_read_input_tokens"] = first_model.get("cacheReadInputTokens", 0)
+                tokens["cache_creation_input_tokens"] = first_model.get("cacheCreationInputTokens", 0)
+            else:
+                tokens["input_tokens"] = usage.get("input_tokens", 0)
+                tokens["output_tokens"] = usage.get("output_tokens", 0)
+                tokens["cache_read_input_tokens"] = usage.get("cache_read_input_tokens", 0)
+                tokens["cache_creation_input_tokens"] = usage.get("cache_creation_input_tokens", 0)
+            return tokens
+        except (json.JSONDecodeError, KeyError, TypeError) as e:
+            logger.debug(f"解析 token JSON 失败: {e}")
+            return {}
+
+    def _emit_tool_call_event(self, task: str, success: bool, tokens: dict) -> None:
+        """ponytail: 统一工具调用埋点（含 minimaxi token）。所有 claude_code.execute() 调用都自动埋点。"""
+        try:
+            emit_event(
+                "tool.call",
+                tool_name="claude_code",
+                phase="end",
+                tool_args_hash=hash_args(task[:200]),
+                success=success,
+                prompt_tokens=tokens.get("input_tokens", 0) if tokens else 0,
+                completion_tokens=tokens.get("output_tokens", 0) if tokens else 0,
+            )
+        except Exception as e:
+            logger.debug(f"emit tool.call 失败: {e}")
 
     def _sanitize_name(self, name: str) -> str:
         """清理名称，移除特殊字符"""

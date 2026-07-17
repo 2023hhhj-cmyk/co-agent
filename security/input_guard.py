@@ -29,6 +29,12 @@ from typing import List, Optional
 
 from observability.metrics import input_rejected as rejected_counter
 
+try:
+    from analytics import emit_event  # 埋点（agent 简历数据采集）
+except Exception:  # noqa: BLE001
+    def emit_event(*_a, **_kw):  # type: ignore[no-redef]
+        return None
+
 logger = logging.getLogger(__name__)
 
 MAX_CONTENT_LENGTH = 5000
@@ -158,6 +164,7 @@ class InputGuard:
         # 1. 空内容检查
         if not content or len(content.strip()) < self.min_length:
             rejected_counter.labels(source=source, reason="empty").inc()
+            emit_event("input.guard.rejected", reason_code="empty", source=source)
             return ValidationResult(
                 allowed=False,
                 content="",
@@ -168,6 +175,7 @@ class InputGuard:
         # 2. P0 #7：检测零宽字符（混淆绕过手段）
         if ZERO_WIDTH_PATTERN.search(content):
             rejected_counter.labels(source=source, reason="zero_width_chars").inc()
+            emit_event("input.guard.rejected", reason_code="zero_width", source=source)
             logger.warning(f"[InputGuard] 零宽字符检测: source={source}")
             return ValidationResult(
                 allowed=False,
@@ -196,6 +204,7 @@ class InputGuard:
             if pattern.search(normalized):
                 logger.warning(f"[InputGuard] Prompt 注入检测: source={source}, pattern={pattern.pattern[:50]}...")
                 rejected_counter.labels(source=source, reason="prompt_injection").inc()
+                emit_event("input.guard.rejected", reason_code="prompt_injection", source=source)
                 return ValidationResult(
                     allowed=False,
                     content=cleaned,
@@ -208,6 +217,7 @@ class InputGuard:
             if pattern.search(normalized):
                 logger.warning(f"[InputGuard] 编码混淆检测: source={source}, pattern={pattern.pattern[:50]}...")
                 rejected_counter.labels(source=source, reason="encoding_obfuscation").inc()
+                emit_event("input.guard.rejected", reason_code="encoding_obfuscation", source=source)
                 return ValidationResult(
                     allowed=False,
                     content=cleaned,
@@ -220,6 +230,7 @@ class InputGuard:
             if pattern.search(normalized):
                 logger.warning(f"[InputGuard] Markdown 隐藏指令检测: source={source}")
                 rejected_counter.labels(source=source, reason="markdown_hidden").inc()
+                emit_event("input.guard.rejected", reason_code="markdown_hidden", source=source)
                 return ValidationResult(
                     allowed=False,
                     content=cleaned,
@@ -232,6 +243,7 @@ class InputGuard:
             if pattern.search(cleaned):
                 logger.warning(f"[InputGuard] SQL 注入检测: source={source}")
                 rejected_counter.labels(source=source, reason="sql_injection").inc()
+                emit_event("input.guard.rejected", reason_code="sql_injection", source=source)
                 return ValidationResult(
                     allowed=False,
                     content=cleaned,

@@ -28,6 +28,12 @@ class LLMClient(ABC):
         self.model = model
         self._client: Optional[httpx.AsyncClient] = None
         self._cache: Any = None  # ResponseCache 实例
+        # ponytail: last API usage captured for analytics (agent.think tokens).
+        self._last_usage: Dict[str, int] = {}
+
+    def get_last_usage(self) -> Dict[str, int]:
+        """返回最近一次 chat 的 token usage（缓存命中时为空）。"""
+        return dict(self._last_usage)
 
     def set_cache(self, cache: Any) -> None:
         """注入响应缓存"""
@@ -82,6 +88,8 @@ class LLMClient(ABC):
         # 检查缓存
         cached = await self._check_cache(messages, temperature, use_cache)
         if cached:
+            # ponytail: cache hit = 0 new tokens, clear so analytics stays accurate
+            self._last_usage = {}
             return cached
 
         # 调实际 API
@@ -91,6 +99,7 @@ class LLMClient(ABC):
             return result
         except Exception:
             await self._store_cache(messages, temperature, "", success=False)
+            self._last_usage = {}
             raise
 
     @abstractmethod
@@ -244,6 +253,7 @@ class DeepSeekClient(LLMClient):
             )
             response.raise_for_status()
             data = response.json()
+            self._last_usage = data.get("usage", {}) or {}
             message = data["choices"][0]["message"]
             # 推理模型（如 deepseek-v4-pro）可能把内容放在 reasoning_content 中
             content = message.get("content", "")
@@ -309,6 +319,12 @@ class ClaudeClient(LLMClient):
             )
             response.raise_for_status()
             data = response.json()
+            # Anthropic uses input_tokens/output_tokens; map to OpenAI-style for unified analytics
+            _u = data.get("usage", {}) or {}
+            self._last_usage = {
+                "prompt_tokens": _u.get("input_tokens", 0),
+                "completion_tokens": _u.get("output_tokens", 0),
+            }
             return data["content"][0]["text"]
         except Exception as e:
             logger.error(f"Claude API call failed: {type(e).__name__}", exc_info=True)

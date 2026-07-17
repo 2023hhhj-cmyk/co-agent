@@ -9,11 +9,18 @@
 
 import asyncio
 import logging
+import time
 from typing import Any, Dict, List, Optional
 
 from models.message import Message
 from models.workflow import NodeType
 from workflows.graph import WorkflowGraph
+
+try:
+    from analytics import emit_event  # 埋点（agent 简历数据采集）
+except Exception:  # noqa: BLE001
+    def emit_event(*_a, **_kw):  # type: ignore[no-redef]
+        return None
 
 logger = logging.getLogger(__name__)
 
@@ -73,7 +80,9 @@ class AgentNodeExecutor(NodeExecutor):
             role = node_id
 
         if role not in self.agents:
+            logger.error(f"DEBUG AgentNodeExecutor: role={role!r} not in self.agents keys={list(self.agents.keys())}")
             raise ValueError(f"Agent not found for role: {role}")
+        logger.info(f"DEBUG AgentNodeExecutor: node={node_id} role={role} agent={type(self.agents[role]).__name__}")
 
         agent = self.agents[role]
 
@@ -174,6 +183,14 @@ class WorkflowExecutor:
         layers = self.graph.topological_sort()
         logger.info(f"Topology layers: {layers}")
 
+        # 埋点：workflow.start
+        _workflow_id = getattr(self.graph, "id", None) or "wf-unknown"
+        _node_count = sum(len(layer) for layer in layers)
+        _topo_depth = len(layers)
+        emit_event("workflow.start", workflow_id=_workflow_id,
+                   node_count=_node_count, topo_depth=_topo_depth)
+        _wf_start = time.time()
+
         # 执行上下文
         context: Dict[str, Any] = {
             "input": input_message.to_dict(),
@@ -184,49 +201,107 @@ class WorkflowExecutor:
         if extra_context:
             context.update(extra_context)
 
-        # 按层执行
-        for layer_idx, layer in enumerate(layers):
-            logger.info(f"Executing layer {layer_idx}: {layer}")
+        try:
+            # 按层执行
+            for layer_idx, layer in enumerate(layers):
+                logger.info(f"Executing layer {layer_idx}: {layer}")
 
-            # 并行执行当前层的节点
-            tasks = []
-            for node_id in layer:
-                task = self._execute_node(node_id, input_message, context)
-                tasks.append((node_id, task))
+                # 并行执行当前层的节点
+                _parallel_count = len(layer)
+                tasks = []
+                for node_id in layer:
+                    task = self._execute_node_traced(
+                        node_id, input_message, context,
+                        depth=layer_idx, parallel_count=_parallel_count,
+                        workflow_id=_workflow_id,
+                    )
+                    tasks.append((node_id, task))
 
-            # 等待当前层所有节点完成
-            results = await asyncio.gather(
-                *[task for _, task in tasks],
-                return_exceptions=True,
+                # 等待当前层所有节点完成
+                results = await asyncio.gather(
+                    *[task for _, task in tasks],
+                    return_exceptions=True,
+                )
+
+                # 处理结果
+                for (node_id, _), result in zip(tasks, results):
+                    if isinstance(result, Exception):
+                        logger.error(f"Node {node_id} failed: {result}")
+                        context["outputs"][node_id] = {
+                            "error": str(result),
+                        }
+                    else:
+                        context["outputs"][node_id] = result.to_dict()
+                        # 更新输入消息为当前节点的输出（供下一层使用）
+                        input_message = result
+
+                        # 进度回调
+                        if self.on_progress:
+                            try:
+                                await self.on_progress(node_id, result)
+                            except Exception as e:
+                                logger.warning(f"Progress callback failed for {node_id}: {e}")
+
+                logger.info(f"Layer {layer_idx} completed")
+
+            # 收集最终输出
+            final_output = self._collect_final_output(context)
+            context["final_output"] = final_output
+
+            # 埋点：workflow.end（成功路径）
+            _total = _node_count
+            _success_n = sum(
+                1 for v in context["outputs"].values()
+                if not (isinstance(v, dict) and "error" in v)
             )
+            if _success_n == _total and _total > 0:
+                _status = "success"
+            elif _success_n == 0:
+                _status = "fail"
+            else:
+                _status = "partial"
+            emit_event("workflow.end", workflow_id=_workflow_id, status=_status,
+                       total_nodes=_total, success_nodes=_success_n,
+                       duration_s=round(time.time() - _wf_start, 3))
 
-            # 处理结果
-            for (node_id, _), result in zip(tasks, results):
-                if isinstance(result, Exception):
-                    logger.error(f"Node {node_id} failed: {result}")
-                    context["outputs"][node_id] = {
-                        "error": str(result),
-                    }
-                else:
-                    context["outputs"][node_id] = result.to_dict()
-                    # 更新输入消息为当前节点的输出（供下一层使用）
-                    input_message = result
+            logger.info(f"Workflow execution completed: {self.graph.id}")
+            return context
+        except Exception:
+            # 失败也要埋点 workflow.end
+            emit_event("workflow.end", workflow_id=_workflow_id, status="fail",
+                       total_nodes=_node_count, success_nodes=0,
+                       duration_s=round(time.time() - _wf_start, 3))
+            raise
 
-                    # 进度回调
-                    if self.on_progress:
-                        try:
-                            await self.on_progress(node_id, result)
-                        except Exception as e:
-                            logger.warning(f"Progress callback failed for {node_id}: {e}")
-
-            logger.info(f"Layer {layer_idx} completed")
-
-        # 收集最终输出
-        final_output = self._collect_final_output(context)
-        context["final_output"] = final_output
-
-        logger.info(f"Workflow execution completed: {self.graph.id}")
-        return context
+    async def _execute_node_traced(
+        self,
+        node_id: str,
+        input_message: Message,
+        context: Dict[str, Any],
+        depth: int,
+        parallel_count: int,
+        workflow_id: str,
+    ) -> Message:
+        """包一层埋点的节点执行器（保持原 _execute_node 逻辑不变）。"""
+        node = self.graph.get_node(node_id)
+        node_type = node.type.value if node else "unknown"
+        emit_event("workflow.node", workflow_id=workflow_id, node_id=node_id,
+                   node_type=node_type, depth=depth, parallel_count=parallel_count,
+                   phase="start")
+        _n_start = time.time()
+        try:
+            result = await self._execute_node(node_id, input_message, context)
+            emit_event("workflow.node", workflow_id=workflow_id, node_id=node_id,
+                       node_type=node_type, depth=depth, parallel_count=parallel_count,
+                       phase="end", duration_ms=int((time.time() - _n_start) * 1000),
+                       success=True)
+            return result
+        except Exception:
+            emit_event("workflow.node", workflow_id=workflow_id, node_id=node_id,
+                       node_type=node_type, depth=depth, parallel_count=parallel_count,
+                       phase="end", duration_ms=int((time.time() - _n_start) * 1000),
+                       success=False)
+            raise
 
     async def _execute_node(
         self,

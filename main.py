@@ -66,6 +66,7 @@ from security import InputGuard, SandboxedExecutor, PolicyEnforcer, AuditLogger
 from storage.database import Database
 from storage.state_manager import StateManager
 from tools.llm.router import LLMRouter
+from tools.monitor.webhook_health import start_webhook_monitor
 
 # 初始化结构化日志 (JSON + trace_id)
 setup_logging(level=logging.INFO)
@@ -347,6 +348,15 @@ async def lifespan(app: FastAPI):
     logger.info(f"客服系统已启动: batch_size={settings.CS_QUEUE_BATCH_SIZE}")
 
     logger.info("All systems initialized")
+
+    # ponytail: 启动 Webhook 健康检查（每小时测一次 3 个回调 URL）
+    try:
+        monitor_task = start_webhook_monitor()
+        if monitor_task:
+            logger.info("Webhook monitor 已启动（每小时 1 次）")
+    except Exception as e:
+        logger.warning(f"Webhook monitor 启动失败: {e}")
+
     yield
 
     # 清理
