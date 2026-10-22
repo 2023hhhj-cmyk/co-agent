@@ -1,5 +1,7 @@
 # Co-Agent Code Review Report
 
+> 历史审查快照（2026-06-18），不是当前代码的复审结论。2026-10-06 的实现状态与边界见 [AGENTS.md](../AGENTS.md) 和 [产品说明](product.md)。本次保留原报告正文。
+
 > 审查时间：2026-06-18 · 范围：61 文件 / 486 节点 / 2597 边
 > 图谱效率：已用 `code-review-graph` 节省约 95% token 探索成本
 > 审查人：Claude Code
@@ -277,7 +279,7 @@ except Exception as e:
 `tools/deploy/monitor.py`（未读）— `_monitor_loop` 30 秒跑一次。回调异常只是 log，但 `_handle_unhealthy` 的 `on_failure` 如果抛错会导致监控循环退出。
 
 ### 24. FastAPI 启动期 lifespan 失败
-`main.py:172-312` 里 `lifespan` 启动失败任意一步（如 ChromaDB 不可用），整个 app 启动失败。但里面很多子步骤已经有 try/except 容错（如 KnowledgeMemory），不一致。
+`main.py:172-312` 里 `lifespan` 启动失败任意一步（如可选依赖不可用），整个 app 启动失败。但里面很多子步骤已经有 try/except 容错（如 KnowledgeMemory），不一致。
 
 ### 25. Webhook 缺少 idempotency-key
 企业微信/飞书在 5 秒超时后会重试。当前 200 返回 0，没法区分"已处理"和"未处理"。

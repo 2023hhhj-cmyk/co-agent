@@ -16,9 +16,9 @@
 |------|------|----------|
 | CEO | 接收需求（飞书）、拆解任务、调度团队、追踪进度 | 用户（飞书）→ 下级Agent |
 | 开发工程师 | 理解需求、设计架构、代码实现、交付产品 | CEO（直接接收任务） |
-| UI设计师 | 界面设计、交互原型 | CEO（可选参与） |
+| 前端专家 | 界面设计、前端开发 | CEO（可选参与） |
 | 运维工程师 | 部署、监控、告警 | 开发完成后的产品 |
-| 财务人员 | 合同、账单、成本核算 | 项目信息 |
+| 客服 | FAQ、项目进度查询与转人工 | 企业微信客户 |
 
 > **注意**：没有产品经理角色。CEO 直接将客户需求转化为 Developer 可执行的详细任务描述。
 
@@ -43,8 +43,6 @@
                     └───────────┼───────────┘
                                 ▼
                            DevOps 部署
-                                ▼
-                          Finance 结算
                                 ▼
                          飞书推送结果给用户
 ```
@@ -74,7 +72,7 @@
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                  YAML 工作流定义 (ChatDev)                    │
-│  nodes: [CEO, Dev, Design, Ops, Finance]                    │
+│  nodes: [CEO, Dev, Design, Ops]                             │
 │  edges: [条件路由, 并行分支, 循环]                             │
 └─────────────────────────────────────────────────────────────┘
                               ↓
@@ -91,7 +89,7 @@
                               ↓
 ┌─────────────────────────────────────────────────────────────┐
 │                  工具集成层                                    │
-│  飞书(WebSocket) | Claude Code CLI                           │
+│  飞书(WebSocket) | opencode CLI                           │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -123,17 +121,12 @@ phases:
   - name: "部署"
     required_agents: ["devops"]
     can_parallel: false
-
-  - name: "结算"
-    required_agents: ["finance"]
-    can_parallel: false
 ```
 
 **执行流程**：
 ```
 Layer 1: [dev, design]   # 开发和设计并行（CEO 直接分配任务）
 Layer 2: [deploy]        # 部署
-Layer 3: [finance]       # 财务记录
 ```
 
 ---
@@ -144,11 +137,11 @@ Layer 3: [finance]       # 财务记录
 |------|------|
 | LLM | DeepSeek |
 | Agent编排 | 自研（MetaGPT + ChatDev 融合） |
-| 消息通信 | 内存 MessageBus（发布/订阅） |
+| 消息通信 | 工作流直接调用 agent.run()；客服走 Redis 队列 |
 | 飞书接入 | lark-oapi SDK（WebSocket 长连接） |
 | 企业微信接入 | httpx 原生调用（智能机器人 + 回调） |
 | 状态存储 | Redis + PostgreSQL |
-| 向量数据库 | ChromaDB |
+| 向量数据库 | PostgreSQL + pgvector |
 | Web框架 | FastAPI |
 
 ---
@@ -157,7 +150,7 @@ Layer 3: [finance]       # 财务记录
 
 ```
 co-agent/
-├── agents/                # 6个Agent（MetaGPT角色机制）
+├── agents/                # 5个Agent（MetaGPT角色机制）
 │   ├── base.py           # Agent基类（Think-Act-Observe）
 │   ├── ceo/agent.py      # CEO：飞书 + 企业微信 + 任务拆解 + 调度
 │   │   ├── product.md    # CEO 知识文件（公司和产品信息）
@@ -165,10 +158,9 @@ co-agent/
 │   ├── customer_service/agent.py # 客服：企业微信智能机器人
 │   │   ├── product.md    # 客服知识文件
 │   │   └── soul.md       # 客服人格文件
-│   ├── developer/agent.py # 开发：Claude Code 构建产品 + 自动生成 product.md
+│   ├── developer/agent.py # 开发：opencode 构建产品 + 自动生成 product.md
 │   ├── frontend_expert/agent.py
-│   ├── devops/agent.py
-│   └── finance/agent.py
+│   └── devops/agent.py
 ├── channels/              # 通信通道层
 │   ├── feishu.py         # 飞书 API + WebSocket 长连接
 │   └── wecom.py          # 企业微信 API + 智能机器人
@@ -184,18 +176,18 @@ co-agent/
 │   └── workflow.py       # 工作流定义
 ├── templates/             # 项目模板
 │   └── project_template.yaml  # 阶段约束模板
-├── communication/         # 消息系统
-│   └── message_bus.py    # 消息总线（发布/订阅）
+├── communication/         # 客服消息队列
+│   └── queue.py          # CSMessageQueue + QueueWorker
 ├── tools/llm/             # LLM工具
 │   ├── client.py         # DeepSeek 客户端
 │   ├── router.py         # LLM路由器
 │   └── prompt.py         # 提示词管理
 ├── tools/code/            # 代码工具
-│   └── claude_code.py    # Claude Code CLI 封装
+│   └── opencode.py    # opencode CLI 封装
 ├── memory/                 # 三层记忆系统
 │   ├── working.py         # WorkingMemory (Layer 1)
 │   ├── session.py         # SessionMemory (Layer 2, Redis+PG)
-│   ├── knowledge.py       # KnowledgeMemory (Layer 3, ChromaDB)
+│   ├── knowledge.py       # KnowledgeMemory (Layer 3, pgvector)
 │   ├── manager.py         # MemoryManager (统一入口 + 5种召回策略)
 │   ├── importance.py      # ImportanceScorer (5维评分)
 │   ├── consolidator.py    # MemoryConsolidator (LLM自动提炼)
@@ -226,12 +218,11 @@ co-agent/
 | 接口 | 方法 | 说明 |
 |------|------|------|
 | `/` | GET | 根路径 |
-| `/health` | GET | 增强健康检查 (PG/Redis/ChromaDB/Docker) |
+| `/health` | GET | 增强健康检查 (PG/Redis/pgvector/Docker) |
 | `/metrics` | GET | Prometheus 指标端点 |
 | `/api/requirement` | POST | 创建需求（触发工作流） |
 | `/api/agents` | GET | Agent状态 |
 | `/api/workflow` | GET | 工作流信息 |
-| `/api/messages/history` | GET | 消息历史 |
 | `/api/feishu/webhook` | POST | 飞书事件回调（备用） |
 | `/api/wecom/ceo/callback` | GET/POST | 企业微信 CEO 机器人回调 |
 | `/api/wecom/cs/callback` | GET/POST | 企业微信客服机器人回调 |
@@ -251,11 +242,11 @@ co-agent/
 | 简单代码生成、重构 | DeepSeek | 性价比高 |
 | 架构设计、技术方案 | DeepSeek | 统一模型，简化架构 |
 | 日常编码、CRUD | DeepSeek | 性价比高 |
-| 实际产品构建 | Claude Code CLI | 通过 CC Switch 配置模型，支持并行执行 |
+| 实际产品构建 | opencode CLI | 通过 CC Switch 配置模型，支持并行执行 |
 | CEO 任务拆解 | DeepSeek | 需要结构化 JSON 输出 |
 
 **Developer Agent 工作方式**：
-- 调用 Claude Code CLI 在客户专属目录下构建实际产品
+- 调用 opencode CLI 在客户专属目录下构建实际产品
 - 模型选择由 CC Switch 管理（当前配置：mimo-v2.5-pro）
 - 支持最多 8 个并行实例
 - 最终交付成果摘要文档，而非代码本身
@@ -267,7 +258,6 @@ co-agent/
 **核心表**：
 - `projects` - 项目表
 - `tasks` - 任务表
-- `transactions` - 财务表
 - `conversations` - 对话历史
 - `memories` - 记忆表
 - `audit_logs` - 审计日志
@@ -283,8 +273,7 @@ co-agent/
 |------|------|------|
 | FastAPI | 8080 | Agent应用 |
 | Redis | 6379 | 缓存 |
-| PostgreSQL | 5432 | 主数据库 |
-| ChromaDB | 8000 | 向量数据库 |
+| PostgreSQL | 5432 | 业务数据与 pgvector 长期知识 |
 
 ---
 
@@ -294,10 +283,10 @@ co-agent/
 
 | 阶段 | 状态 | 说明 |
 |------|------|------|
-| Phase 1: 基础设施 | ✅ 完成 | Redis、PostgreSQL、ChromaDB、Docker |
+| Phase 1: 基础设施 | ✅ 完成 | Redis、PostgreSQL + pgvector、Docker |
 | Phase 2: 融合架构 | ✅ 完成 | MetaGPT角色 + ChatDev图工作流 |
-| Phase 3: Agent逻辑 | ✅ 完成 | CEO、Developer、Frontend Expert、DevOps、Customer Service、Finance |
-| Phase 4: 工具集成 | ✅ 完成 | 飞书、Claude Code、Docker、Nginx、Design Skills、企业微信 |
+| Phase 3: Agent逻辑 | ✅ 完成 | CEO、Developer、Frontend Expert、DevOps、Customer Service |
+| Phase 4: 工具集成 | ✅ 完成 | 飞书、opencode、Docker、Nginx、Design Skills、企业微信 |
 | Phase 5: 记忆系统 | ✅ 完成 | 三层记忆 + 自动提炼 + 重要性评分 + 主动检索 + 关联图谱 |
 | Phase 6: 安全系统 | ✅ 完成 | InputGuard、Sandbox(Docker)、PolicyEnforcer(RBAC)、AuditLogger |
 | Phase 7: 可观测性 | ✅ 完成 | JSON结构化日志 + Prometheus指标 + 增强健康检查 + 告警规则 |
@@ -311,12 +300,11 @@ co-agent/
 
 | Agent | 状态 | 功能 |
 |------|------|------|
-| CEO Agent | ✅ 完成 | 飞书 WebSocket 通信、企业微信智能机器人、意图分类、需求追问、LLM 任务拆解（模板约束）、确认卡片、混合调度、进度追踪、知识文件（product.md + soul.md）、项目文件读取（claude.md + product.md）、Claude Code 工具 |
-| 开发工程师 Agent | ✅ 完成 | 通过 Claude Code CLI 构建实际产品，支持客户项目管理，接收 CEO 直接分配的任务，自动生成 product.md |
-| 前端专家 Agent | ✅ 完成 | 通过 Claude Code CLI 生成高质量前端页面（Next.js + Tailwind + shadcn/ui），注入 5 个设计 Skills，四步流水线 |
+| CEO Agent | ✅ 完成 | 飞书 WebSocket 通信、企业微信智能机器人、意图分类、需求追问、LLM 任务拆解（模板约束）、确认卡片、混合调度、进度追踪、知识文件（product.md + soul.md）、项目文件读取（claude.md + product.md）、opencode 工具 |
+| 开发工程师 Agent | ✅ 完成 | 通过 opencode CLI 构建实际产品，支持客户项目管理，接收 CEO 直接分配的任务，自动生成 product.md |
+| 前端专家 Agent | ✅ 完成 | 按 CEO 派发任务通过 opencode 生成高质量前端页面（Next.js + Tailwind + shadcn/ui），注入 5 个设计 Skills |
 | 运维工程师 Agent | ✅ 完成 | Docker 容器化部署、Nginx 反向代理、健康检查、持续监控、异常自愈、Web 管理接口 |
 | 客服 Agent | ✅ 完成 | 企业微信智能机器人、意图分类（6种）、项目进度查询、product.md 读取、FAQ、转人工、排队通知、知识文件（product.md + soul.md） |
-| 财务人员 Agent | ⏳ 壳子 | 只有 LLM 文本生成，无实际记账系统 |
 
 ### CEO Agent 功能
 
@@ -332,24 +320,24 @@ co-agent/
 ### Developer Agent 功能
 
 - **客户项目管理**：在 `/root/` 下为客户创建专属目录
-- **Claude Code 集成**：调用 CLI 构建实际产品（网站、应用等）
+- **opencode 集成**：调用 CLI 构建实际产品（网站、应用等）
 - **成果交付**：生成摘要文档交付给下游 Agent
-- **支持并行**：最多 8 个 Claude Code 实例并行执行
+- **支持并行**：最多 8 个 opencode 实例并行执行
 - **直接接收 CEO 任务**：无需 PM 中转
 
 ### Frontend Expert Agent 功能
 
 - **需求分析**：LLM 分析页面类型、设计风格、组件需求，输出结构化分析报告
-- **项目初始化**：通过 Claude Code CLI 创建 Next.js + Tailwind CSS + shadcn/ui 项目
-- **页面实现**：注入 5 个设计 Skills（frontend-design、brand-guidelines、web-design-guidelines、react-best-practices、playwright）作为 context，生成高质量前端代码
+- **项目初始化**：通过 opencode CLI 创建 Next.js + Tailwind CSS + shadcn/ui 项目
+- **页面实现**：由小计划为每个小项选择相关设计 Skills（frontend-design、web-artifacts-builder、react-best-practices、accessibility-engineer、web-design-guidelines）注入 context，生成高质量前端代码
 - **审查打磨**：自动审查设计质量（视觉层次、响应式、可访问性、交互），生成 deliverable.md
 - **四步流水线**：analyze_requirement → setup_project → implement_frontend → review_and_polish
 - **技术栈锁定**：Next.js + Tailwind CSS + shadcn/ui + Lucide Icons，避免 AI 随机选技术栈
-- **Skills 注入机制**：每次 Claude Code 调用自动加载设计规范（13701 字符），无需手动调用
+- **Skills 注入机制**：每次 opencode 调用自动加载设计规范（13701 字符），无需手动调用
 
 ### DevOps Agent 功能
 
-- **智能项目分析**：使用 Claude Code 分析项目目录，自动识别技术栈
+- **智能项目分析**：使用 opencode 分析项目目录，自动识别技术栈
 - **Docker 容器化部署**：自动构建镜像、启动容器、端口管理（8001-9000）
 - **Nginx 反向代理**：路径方式访问（`http://loveboos-ai.com/{客户名}`）
 - **健康检查**：HTTP 检查 + 容器状态监控，每 30 秒一次
@@ -376,7 +364,7 @@ co-agent/
 - **product.md**：公司简介、核心业务、系统能力、服务范围、技术栈
 - **soul.md**：人格定义、性格特征、沟通风格、能力边界、回复模板
 - **项目文件读取**：遍历所有项目的 `claude.md`（项目概述）和 `product.md`（项目进度）
-- **Claude Code 工具**：当项目文件信息不足时，调用 Claude Code 浏览项目代码
+- **opencode 工具**：当项目文件信息不足时，调用 opencode 浏览项目代码
 - **自动加载**：Agent 启动时自动加载知识文件，回答问题时参考
 - **动态更新**：修改知识文件后重启服务即可生效
 
@@ -401,7 +389,7 @@ co-agent/
 |------|------|------|------|
 | Layer 1: 短期 | WorkingMemory | 内存 deque (20条) | 当前任务上下文，快速访问 |
 | Layer 2: 中期 | SessionMemory | Redis (7天热缓存) + PostgreSQL (永久) | 跨会话历史，miss 自动回填 |
-| Layer 3: 长期 | KnowledgeMemory | ChromaDB 向量数据库 | 语义检索，sentence_transformers 本地 embedding |
+| Layer 3: 长期 | KnowledgeMemory | PostgreSQL + pgvector | 语义检索，百炼 text-embedding-v4 |
 
 ### 智能强化 (P0-P2)
 
@@ -433,7 +421,7 @@ co-agent/
 |------|------|------|
 | InputGuard | 第1层：输入校验 | 长度限制、Prompt注入检测、SQL注入检测、HTML/JS净化、空内容拒绝 |
 | SandboxedExecutor | 第2层：沙箱执行 | Docker 容器隔离 (512MB/1CPU/无网络) + 降级只读模式 |
-| PolicyEnforcer | 第3层：权限控制 | 6角色RBAC (watch/action/tool三重权限) |
+| PolicyEnforcer | 第3层：权限控制 | 5角色RBAC (watch/action/tool三重权限) |
 | AuditLogger | 第4层：审计日志 | 7种事件 (input_rejected/task_executed/llm_call/file_access/deploy/auth_failure/memory_access) |
 
 ### 角色权限矩阵
@@ -441,10 +429,9 @@ co-agent/
 | 角色 | watch | actions | tools |
 |------|-------|---------|-------|
 | ceo | user_requirement, task_complete, report, feishu_message | classify, decompose, execute, report | feishu, llm, task_decomposition |
-| developer | ceo_task_assignment, create_prd, architecture_design | design, implement, review | claude_code, llm |
-| frontend_expert | ceo_task_assignment, frontend_task, ui_design | analyze, setup, implement, review | claude_code, llm, playwright |
-| devops | review_code, deploy_request, deploy_fix | deploy, monitor, fix | docker, nginx, claude_code |
-| finance | deploy_complete, project_complete | record_cost, invoice, report | llm |
+| developer | ceo_task_assignment, create_prd, architecture_design | design, implement, review | opencode, llm |
+| frontend_expert | ceo_task_assignment, frontend_task, ui_design | analyze, setup, implement, review | opencode, llm, playwright |
+| devops | review_code, deploy_request, deploy_fix | deploy, monitor, fix | docker, nginx, opencode |
 | customer_service | customer_message | classify, answer, escalate | wecom, database, faq |
 
 ---
@@ -455,7 +442,7 @@ co-agent/
 |------|------|-----------|
 | 结构化日志 | JSON格式 + trace_id 全链路追踪 | stdout (可接入 ELK/Loki) |
 | Prometheus 指标 | 10个指标族 (agent/LLM/message/task/memory/security/cache) | GET /metrics |
-| 健康检查 | 4项依赖检查 (PG/Redis/ChromaDB/Docker) + Agent状态 + 运行时间 | GET /health |
+| 健康检查 | 4项依赖检查 (PG/Redis/pgvector/Docker) + Agent状态 + 运行时间 | GET /health |
 
 ### 告警规则 (6条)
 
@@ -489,7 +476,7 @@ pytest 37个测试用例，覆盖全部核心模块。
 | WorkingMemory | test_working.py | 6 | 单元 |
 | ImportanceScorer | test_importance.py | 6 | 单元 |
 | SessionMemory | test_session.py | 5 | 集成 (Redis+PG) |
-| KnowledgeMemory | test_knowledge.py | 3 | 集成 (ChromaDB) |
+| KnowledgeMemory | test_knowledge.py | 3 | 集成 (PostgreSQL + pgvector) |
 | MemoryConsolidator | test_consolidator.py | 2 | 单元 |
 | InputGuard | test_input_guard.py | 6 | 单元 |
 | PolicyEnforcer | test_access.py | 5 | 单元 |
@@ -505,7 +492,7 @@ pytest 37个测试用例，覆盖全部核心模块。
 - 所有 LLM 路由统一使用 DeepSeek，移除 Claude API 作为辅助模型
 - `router.py`：全部任务类型映射至 DeepSeek
 - `__init__.py`：移除 ClaudeClient 导出
-- 保留 Claude Code CLI（代码生成命令行工具）不受影响
+- 保留 opencode CLI（代码生成命令行工具）不受影响
 
 **代码托管**
 - 创建 GitHub 私有仓库 `2023hhhj-cmyk/co-agent`
@@ -569,5 +556,4 @@ pytest 37个测试用例，覆盖全部核心模块。
 - [x] 可观测性（JSON日志 + Prometheus + 健康检查 + 告警）
 - [x] 系统测试（37个用例）
 - [x] 加速层（LLM缓存 + Prompt压缩 + 嵌入缓存）
-- [ ] 强化 Finance Agent（接入存储层真正记账）
 - [ ] Web 管理界面

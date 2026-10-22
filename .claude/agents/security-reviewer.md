@@ -13,7 +13,7 @@ tools: Read, Grep, Glob, mcp__code-review-graph__*
 
 - **FastAPI + asyncio** 后端，端口 8080
 - **通道**：飞书 WebSocket（`channels/feishu.py`）、企业微信（`channels/wecom.py`）
-- **存储**：PostgreSQL（asyncpg）、Redis（dedup / 持久化）、ChromaDB
+- **存储**：PostgreSQL（asyncpg，含 pgvector）、Redis（dedup / 持久化）
 - **沙箱**：Docker（`security/sandbox.py`）
 - **LLM 路由**：DeepSeek（`tools/llm/router.py`）
 - **客服系统**：企业微信 + Redis List 队列
