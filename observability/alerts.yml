@@ -27,7 +27,7 @@ groups:
           component: security
         annotations:
           summary: "Sandbox is running in fallback readonly mode"
-          description: "Docker sandbox is unavailable, ClaudeCodeTool is limited to read-only operations. Check Docker daemon."
+          description: "Docker sandbox is unavailable, OpenCodeTool is limited to read-only operations. Check Docker daemon."
 
       # ========== 输入拒绝率异常 ==========
       - alert: HighInputRejectRate

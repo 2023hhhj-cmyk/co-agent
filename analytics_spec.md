@@ -53,7 +53,7 @@
 - **目标**：度量 LLM 调用频次、token 消耗、模型分布
 - **触发时机**：`agents/base.py::_react` 中 `_think` 调用的入口与出口
 - **字段**：
-  - `agent_role` [必] 枚举：ceo/developer/devops/frontend_expert/finance/customer_service
+  - `agent_role` [必] 枚举：ceo/developer/devops/frontend_expert/customer_service
   - `phase` [必] 枚举：`start` / `end`
   - `llm_model` [选] 模型名
   - `prompt_tokens` [选] int
@@ -136,7 +136,7 @@
 
 ### 2.11 `agent.error` — Agent 异常
 - **目标**：度量错误率
-- **触发时机**：6 个 Agent 中任意 catch 块
+- **触发时机**：5 个 Agent 中任意 catch 块
 - **字段**：
   - `agent_role` [必]
   - `error_code` [必] 枚举（见 §4）

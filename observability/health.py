@@ -6,7 +6,7 @@
 检查项：
 - PostgreSQL: SELECT 1
 - Redis: PING
-- ChromaDB: heartbeat API
+- pgvector: PostgreSQL 已安装 vector 扩展
 - Docker: docker info
 
 使用方式：
@@ -29,12 +29,10 @@ class HealthChecker:
         self,
         state_manager=None,
         database=None,
-        chromadb_url: str = "",
         agents: Optional[Dict[str, Any]] = None,
     ):
         self.state_manager = state_manager
         self.database = database
-        self.chromadb_url = chromadb_url
         self.agents = agents or {}
         self._start_time = datetime.now(timezone.utc)
 
@@ -43,12 +41,12 @@ class HealthChecker:
         deps = await asyncio.gather(
             self._check_postgresql(),
             self._check_redis(),
-            self._check_chromadb(),
+            self._check_pgvector(),
             self._check_docker(),
             return_exceptions=True,
         )
 
-        dep_names = ["postgresql", "redis", "chromadb", "docker"]
+        dep_names = ["postgresql", "redis", "pgvector", "docker"]
         dependencies = {}
         for name, result in zip(dep_names, deps):
             if isinstance(result, Exception):
@@ -95,19 +93,19 @@ class HealthChecker:
             logger.warning(f"Redis health check failed: {e}")
             return f"error: {str(e)[:100]}"
 
-    async def _check_chromadb(self) -> str:
-        if not self.chromadb_url:
+    async def _check_pgvector(self) -> str:
+        if not self.database:
             return "not_configured"
         try:
-            import httpx
-            async with httpx.AsyncClient() as client:
-                resp = await asyncio.wait_for(
-                    client.get(f"{self.chromadb_url}/api/v1/heartbeat"),
-                    timeout=3.0,
-                )
-                return "ok" if resp.status_code == 200 else f"status_{resp.status_code}"
+            rows = await asyncio.wait_for(
+                self.database.fetch(
+                    "SELECT 1 FROM pg_extension WHERE extname = 'vector'"
+                ),
+                timeout=3.0,
+            )
+            return "ok" if rows else "missing"
         except Exception as e:
-            logger.warning(f"ChromaDB health check failed: {e}")
+            logger.warning(f"pgvector health check failed: {e}")
             return f"error: {str(e)[:100]}"
 
     async def _check_docker(self) -> str:

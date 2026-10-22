@@ -16,7 +16,6 @@ from pathlib import Path
 
 import uvicorn
 from fastapi import FastAPI, Request, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse, JSONResponse
 from slowapi import Limiter
 from slowapi.util import get_remote_address
@@ -40,12 +39,10 @@ from agents import (
     CustomerServiceAgent,
     DeveloperAgent,
     DevOpsAgent,
-    FinanceAgent,
     FrontendExpertAgent,
 )
 from channels.feishu import FeishuClient
 from channels.wecom import WecomClient
-from communication.message_bus import MessageBus
 from communication.queue import CSMessageQueue, QueueWorker, QueuedMessage
 from config.settings import settings
 from acceleration import ResponseCache, EmbeddingCache, PromptOptimizer
@@ -65,6 +62,7 @@ from observability import (
 from security import InputGuard, SandboxedExecutor, PolicyEnforcer, AuditLogger
 from storage.database import Database
 from storage.state_manager import StateManager
+from tools.deploy.customer_container import CustomerContainers
 from tools.llm.router import LLMRouter
 from tools.monitor.webhook_health import start_webhook_monitor
 
@@ -74,12 +72,8 @@ logger = logging.getLogger(__name__)
 
 # ========== 全局组件 ==========
 
-# 存储（先初始化 state_manager，MessageBus 注入需要它）
 state_manager = StateManager()
 database = Database()
-
-# 消息总线（P1 #9 修复：注入 state_manager 做 Redis 持久化）
-message_bus = MessageBus(state_manager=state_manager)
 
 # LLM 路由器
 llm_router = LLMRouter()
@@ -132,41 +126,33 @@ def create_agents():
     # 先创建下级 Agent（注入安全模块）
     devops_agent = DevOpsAgent(
         llm_client=llm_router.get_client_by_agent("devops"),
-        message_bus=message_bus,
         memory_manager=memory_manager,
         policy_enforcer=policy_enforcer,
         audit_logger=audit_logger,
     )
 
+    # 客户容器共享同一个实例：CEO 创建，Developer 在同一容器工作区里写文件
+    customer_containers = CustomerContainers()
+
     agents = {
         "developer": DeveloperAgent(
             llm_client=llm_router.get_client_by_agent("developer"),
-            message_bus=message_bus,
             memory_manager=memory_manager,
             policy_enforcer=policy_enforcer,
             audit_logger=audit_logger,
         ),
         "frontend_expert": FrontendExpertAgent(
             llm_client=llm_router.get_client_by_agent("frontend_expert"),
-            message_bus=message_bus,
             memory_manager=memory_manager,
             policy_enforcer=policy_enforcer,
             audit_logger=audit_logger,
         ),
         "devops": devops_agent,
-        "finance": FinanceAgent(
-            llm_client=llm_router.get_client_by_agent("finance"),
-            message_bus=message_bus,
-            memory_manager=memory_manager,
-            policy_enforcer=policy_enforcer,
-            audit_logger=audit_logger,
-        ),
     }
 
     # CEO 最后创建，注入飞书客户端、团队、状态管理器和输入校验
     agents["ceo"] = CEOAgent(
         llm_client=llm_router.get_client_by_agent("ceo"),
-        message_bus=message_bus,
         feishu_client=feishu_client,
         team=agents,
         memory_manager=memory_manager,
@@ -175,6 +161,10 @@ def create_agents():
         policy_enforcer=policy_enforcer,
         audit_logger=audit_logger,
     )
+
+    # 让 Developer 复用 CEO 的客户容器 API，而不是各自 new 一个
+    for agent in agents.values():
+        agent.customer_containers = customer_containers
 
     # 设置 DevOps Agent 的飞书客户端（用于告警通知）
     # 注意：需要 CEO Agent 的 chat_id，这里先设置客户端，chat_id 在首次消息时获取
@@ -213,7 +203,7 @@ async def lifespan(app: FastAPI):
     try:
         sandbox = SandboxedExecutor(base_dir="/root")
     except Exception as e:
-        logger.warning(f"[Security] 沙箱初始化失败（降级到无沙箱模式）: {e}")
+        logger.warning(f"[Security] 沙箱状态初始化失败（CLI 仍通过独立 Docker 执行器）: {e}")
         sandbox = None
     policy_enforcer = PolicyEnforcer()
     audit_logger = AuditLogger(database=database)
@@ -228,11 +218,10 @@ async def lifespan(app: FastAPI):
     health_checker = HealthChecker(
         state_manager=state_manager,
         database=database,
-        chromadb_url=settings.CHROMADB_URL,
         agents=agents,
     )
     # 设置初始沙箱模式指标
-    sandbox_metric.set(1 if sandbox.mode == "docker" else 0)
+    sandbox_metric.set(1 if sandbox and sandbox.mode == "docker" else 0)
     logger.info("可观测性系统初始化完成")
 
     # 初始化加速层
@@ -252,8 +241,12 @@ async def lifespan(app: FastAPI):
     global session_memory, knowledge_memory, memory_manager
     session_memory = SessionMemory(state_manager=state_manager, database=database)
     try:
-        knowledge_memory = KnowledgeMemory(embedding_cache=embed_cache)
-        logger.info("KnowledgeMemory (ChromaDB) 初始化成功")
+        knowledge_memory = KnowledgeMemory(database=database, embedding_cache=embed_cache)
+        await knowledge_memory.setup()
+        if knowledge_memory.is_ready:
+            logger.info("KnowledgeMemory (PostgreSQL + pgvector) 已就绪")
+        else:
+            logger.warning("KnowledgeMemory 未就绪，语义检索不可用")
     except Exception as e:
         logger.warning(f"KnowledgeMemory 初始化失败，语义检索不可用: {e}")
         knowledge_memory = None
@@ -324,7 +317,6 @@ async def lifespan(app: FastAPI):
     cs_queue = CSMessageQueue(state_manager.redis)
     cs_agent = CustomerServiceAgent(
         llm_client=llm_router.get_client_by_agent("customer_service"),
-        message_bus=message_bus,
         wecom_client=wecom_cs_client,
         db=database,
         redis_client=state_manager.redis,
@@ -376,14 +368,6 @@ app = FastAPI(
     description="多Agent协同系统 - 融合 MetaGPT 角色 + ChatDev 图工作流",
     version="1.0.0",
     lifespan=lifespan,
-)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=settings.CORS_ORIGINS,
-    allow_credentials=False,
-    allow_methods=["GET", "POST"],
-    allow_headers=["Content-Type", "Authorization", "X-API-Key"],
 )
 
 # 速率限制器
@@ -524,9 +508,9 @@ async def metrics():
 @app.post("/api/requirement")
 async def create_requirement(requirement: dict):
     """
-    创建需求 - 通过 CEO 拆解 + WorkflowExecutor 执行
+    创建需求 - CEO 写需求文档并按任务调度执行
 
-    流程：CEO 拆解任务 → 生成动态 DAG → WorkflowExecutor 分层执行
+    流程：CEO 写需求文档、分配任务 → 按依赖分批派给执行器
     """
     content = requirement.get("content", "")
     if not content:
@@ -576,13 +560,6 @@ async def get_workflow():
         "description": "工作流由 CEO Agent 根据需求动态生成，不再使用静态 YAML 定义",
         "template": "templates/project_template.yaml",
     }
-
-
-@app.get("/api/messages/history")
-async def get_message_history(limit: int = 100):
-    """获取消息历史"""
-    history = message_bus.get_history(limit)
-    return {"messages": [msg.to_dict() for msg in history]}
 
 
 @app.get("/api/devops/services")

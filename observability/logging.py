@@ -137,6 +137,5 @@ def setup_logging(level: int = logging.INFO):
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
     logging.getLogger("redis").setLevel(logging.WARNING)
-    logging.getLogger("chromadb").setLevel(logging.WARNING)
 
     root.info("结构化日志已初始化 (JSON format)")

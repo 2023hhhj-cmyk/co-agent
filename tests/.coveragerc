@@ -1,0 +1,43 @@
+[run]
+data_file = tests/artifacts/coverage/.coverage
+# 覆盖率配置
+source =
+    agents
+    channels
+    communication
+    models
+    observability
+    security
+    storage
+    tools
+    workflows
+    main.py
+
+# 排除不需要覆盖的代码
+omit =
+    */__pycache__/*
+    */tests/*
+    */venv/*
+    */__init__.py
+    */migrations/*
+
+[report]
+# 覆盖率目标
+# 失败阈值：CI 低于此值会失败
+fail_under = 30
+
+# 排除行
+exclude_lines =
+    pragma: no cover
+    raise NotImplementedError
+    if __name__ == .__main__.:
+    def __repr__
+    raise AssertionError
+    raise NotImplementedError
+    if TYPE_CHECKING:
+    @abstractmethod
+
+# 报告精度
+precision = 1
+show_missing = True
+skip_covered = True
