@@ -24,6 +24,34 @@ FULL_TOOLS = ["Read", "Write", "Edit", "Bash", "Glob", "Grep"]
 # 容器只接收这些模型配置，不转发平台其他凭证。
 MODEL_ENV_KEYS = ("OPENCODE_API_KEY",)
 
+_MEMORY_UNITS = {"b": 1 / (1024 * 1024), "k": 1 / 1024, "m": 1, "g": 1024}
+
+
+def _memory_mib(value: str) -> int:
+    """把 docker --memory 的写法（512m / 1g / 1.5g）换算成 MiB，无法解析时返回 0。"""
+    text = str(value or "").strip().lower()
+    if not text:
+        return 0
+    unit = text[-1]
+    number = text[:-1] if unit in _MEMORY_UNITS else text
+    try:
+        amount = float(number)
+    except ValueError:
+        return 0
+    return int(amount * _MEMORY_UNITS.get(unit, 1))
+
+
+def _node_heap_mb(memory: str) -> int:
+    """V8 堆上限取容器内存的 3/4。
+
+    Node 有时按宿主机内存估算堆上限，容器里会被 OOM 直接杀掉（exit 137）；
+    显式钉死堆大小，让超限表现为 GC 压力而不是整容器被杀。
+    """
+    mib = _memory_mib(memory)
+    if mib <= 0:
+        return 768
+    return max(256, int(mib * 0.75))
+
 
 @dataclass
 class SandboxResult:
@@ -196,6 +224,8 @@ class SandboxedExecutor:
                     "--user", f"{os.getuid()}:{os.getgid()}",
                     "--env-file", str(env_file),
                     "--env", "HOME=/tmp/opencode-home",
+                    "--env",
+                    f"NODE_OPTIONS=--max-old-space-size={_node_heap_mb(settings.OC_SANDBOX_MEMORY)}",
                     "--env", "OPENCODE_DISABLE_AUTOUPDATE=1",
                     "--mount", mount,
                     "--workdir", "/workspace", self.docker_image,

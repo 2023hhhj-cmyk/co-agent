@@ -26,7 +26,7 @@ class Settings(BaseSettings):
     DEEPSEEK_MODEL: str = "deepseek-v4-pro"
     # Docker 中的 opencode 仅接收这些模型配置，不转发平台其他凭证。
     OC_SANDBOX_IMAGE: str = "muzhu-sandbox:latest"
-    OC_SANDBOX_MEMORY: str = "2g"
+    OC_SANDBOX_MEMORY: str = "1g"
     OC_SANDBOX_CPUS: float = Field(default=1.0, gt=0)
     OPENCODE_MODEL: str = "opencode-go/deepseek-v4-pro"
     OPENCODE_AGENT: str = "build"

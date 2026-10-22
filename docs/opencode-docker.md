@@ -37,7 +37,7 @@ docker run --rm --network none muzhu-sandbox:latest opencode --version
 
 ```dotenv
 OC_SANDBOX_IMAGE=muzhu-sandbox:latest
-OC_SANDBOX_MEMORY=2g
+OC_SANDBOX_MEMORY=1g
 OC_SANDBOX_CPUS=1
 # opencode-go provider key；留空时回退读取宿主机 opencode 登录态。
 OPENCODE_API_KEY=
