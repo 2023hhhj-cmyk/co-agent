@@ -141,7 +141,7 @@ class WorkflowGraph:
     DAG 工作流图
 
     借鉴 ChatDev 的图结构：
-    - 节点代表 Agent 或工具
+    - 节点代表 Agent 任务单元（工具由 Agent 内部自治调用，不作为独立图节点）
     - 边代表消息传递路径
     - 支持拓扑排序和条件路由
     """

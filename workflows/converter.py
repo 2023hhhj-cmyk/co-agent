@@ -48,6 +48,7 @@ class PlanToGraphConverter:
                 config={
                     "task_title": task.title,
                     "priority": task.priority,
+                    "acceptance": task.acceptance,
                 },
             ))
 

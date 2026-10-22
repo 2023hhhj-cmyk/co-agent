@@ -3,7 +3,7 @@
 
 职责：
 1. 接收 Developer 的产出，自动部署应用
-2. 使用 Claude Code 分析项目，生成 Dockerfile
+2. 使用 opencode 分析项目，生成 Dockerfile
 3. Docker 容器化部署
 4. Nginx 反向代理配置
 5. 持续监控和异常自愈
@@ -24,7 +24,7 @@ from agents.base import BaseAgent
 from models.agent import ActionDef, AgentRole, ReactMode
 from models.deploy import DeployRecord, ServiceStatus
 from models.message import Message
-from tools.code.claude_code import ClaudeCodeTool
+from tools.code.opencode import OpenCodeTool
 from tools.deploy.analyzer import ProjectAnalyzer
 from tools.deploy.docker import DockerManager, PortManager
 from tools.deploy.monitor import ServiceMonitor
@@ -39,7 +39,7 @@ DEVOPS_ROLE = AgentRole(
     profile="运维工程师",
     goal="部署、监控和维护应用，确保系统稳定运行",
     constraints="确保部署安全，监控全面，故障快速恢复",
-    tools=["docker", "nginx", "monitoring", "claude_code"],
+    tools=["docker", "nginx", "monitoring", "opencode"],
     actions=[
         ActionDef(
             name="deploy",
@@ -74,7 +74,6 @@ class DevOpsAgent(BaseAgent):
     def __init__(
         self,
         llm_client: Optional[LLMClient] = None,
-        message_bus: Any = None,
         base_dir: str = "/root",
         **kwargs,
     ):
@@ -82,18 +81,17 @@ class DevOpsAgent(BaseAgent):
         super().__init__(
             role=DEVOPS_ROLE,
             llm_client=llm_client,
-            message_bus=message_bus,
             **kwargs,
         )
 
         self.base_dir = base_dir
 
         # 初始化工具
-        self.claude_code = ClaudeCodeTool(
+        self.opencode = OpenCodeTool(
             base_dir=base_dir,
             timeout=300,
         )
-        self.analyzer = ProjectAnalyzer(self.claude_code)
+        self.analyzer = ProjectAnalyzer(self.opencode)
         self.port_manager = PortManager(start=8001, end=9000)
         self.docker = DockerManager(self.port_manager)
         self.nginx = NginxManager(domain="loveboos-ai.com")
@@ -252,15 +250,15 @@ class DevOpsAgent(BaseAgent):
             record.tech_stack = project_info.tech_stack
             record.health_check_path = project_info.health_check_path
 
-            # 第 2 步：生成配置文件（如果 Claude Code 没有生成）
+            # 第 2 步：生成配置文件（如果 opencode 没有生成）
             if not project_info.dockerfile_content:
-                logger.info("Claude Code 未生成 Dockerfile，使用默认配置")
+                logger.info("opencode 未生成 Dockerfile，使用默认配置")
                 project_info.dockerfile_content = self.analyzer.generate_default_dockerfile(
                     project_info.project_type
                 )
 
             if not project_info.compose_content:
-                logger.info("Claude Code 未生成 docker-compose.yml，使用默认配置")
+                logger.info("opencode 未生成 docker-compose.yml，使用默认配置")
                 project_info.compose_content = self.analyzer.generate_default_compose(
                     service_name, 8000
                 )

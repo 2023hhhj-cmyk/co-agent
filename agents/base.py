@@ -73,7 +73,6 @@ class BaseAgent(ABC):
         self,
         role: AgentRole,
         llm_client: Optional[LLMClient] = None,
-        message_bus: Any = None,
         memory_manager: Optional["MemoryManager"] = None,
         policy_enforcer: Any = None,
         audit_logger: Any = None,
@@ -82,7 +81,6 @@ class BaseAgent(ABC):
         self.agent_id = str(uuid.uuid4())
         self.role = role
         self.llm = llm_client
-        self.message_bus = message_bus
         self.prompt_manager = PromptManager()
 
         # 状态
@@ -108,10 +106,6 @@ class BaseAgent(ABC):
         # 动作状态
         self.todo: ActionDef | None = None
         self.state_index: int = 0  # BY_ORDER 模式下的状态索引
-
-        # 注册到消息总线
-        if message_bus and role.watch:
-            message_bus.register_agent(self.agent_id, role.watch)
 
     # ========== 属性 ==========
 
@@ -141,19 +135,9 @@ class BaseAgent(ABC):
         """
         观察阶段：从消息队列读取消息
 
-        借鉴 MetaGPT：
-        - 只处理 watch 匹配的消息
-        - 过滤掉自己发送的消息
+        只处理本次 run() 放入本地队列、且 watch 匹配的消息。
         """
-        # 先从本地队列获取消息（run() 方法推入的）
-        local_messages = await self.message_queue.pop_all()
-
-        if self.message_bus:
-            # 再从消息总线获取消息（其他 Agent 发布的）
-            bus_messages = await self.message_bus.get_messages(self.agent_id)
-            messages = local_messages + bus_messages
-        else:
-            messages = local_messages
+        messages = await self.message_queue.pop_all()
 
         # 过滤：只保留 watch 匹配的消息
         if self.role.watch:
@@ -420,6 +404,8 @@ class BaseAgent(ABC):
 
         import time
         task_start = time.time()
+        result = None
+        succeeded = False
         try:
             # 根据反应模式执行
             if self.role.react_mode == ReactMode.REACT:
@@ -435,6 +421,7 @@ class BaseAgent(ABC):
             if result:
                 await self.publish_message(result)
 
+            succeeded = True
             return result
 
         except Exception as e:
@@ -443,9 +430,12 @@ class BaseAgent(ABC):
             agent_state_metric.labels(agent=self.name, role=self.role.name).set(2)
             task_total.labels(agent=self.name, status="error").inc()
             if self.audit_logger:
-                await self.audit_logger.log_task_executed(
-                    self.agent_id, str(e)[:200], result="error", duration_ms=0,
-                )
+                try:
+                    await self.audit_logger.log_task_executed(
+                        self.agent_id, str(e)[:200], result="error", duration_ms=0,
+                    )
+                except Exception:
+                    logger.exception("记录任务失败审计时出错")
             # 埋点：agent.error
             emit_event("agent.error", agent_role=self.role.name,
                        error_code=_classify_error(e),
@@ -457,14 +447,18 @@ class BaseAgent(ABC):
             self.todo = None
             agent_state_metric.labels(agent=self.name, role=self.role.name).set(0)
             task_duration_metric.labels(agent=self.name).observe(elapsed)
-            task_total.labels(agent=self.name, status="success").inc()
-            # 审计日志：任务执行
-            if self.audit_logger and result:
-                await self.audit_logger.log_task_executed(
-                    self.agent_id,
-                    result.content[:200] if result.content else "",
-                    result="success",
-                )
+            if succeeded:
+                task_total.labels(agent=self.name, status="success").inc()
+            # 审计失败不改变任务执行结果。
+            if succeeded and self.audit_logger and result:
+                try:
+                    await self.audit_logger.log_task_executed(
+                        self.agent_id,
+                        result.content[:200] if result.content else "",
+                        result="success",
+                    )
+                except Exception:
+                    logger.exception("记录任务成功审计时出错")
             # 自动归档短期记忆到中期记忆
             if self.memory_manager and self.working_memory and not self.working_memory.is_empty:
                 try:
@@ -491,25 +485,14 @@ class BaseAgent(ABC):
 
     async def publish_message(self, message: Message) -> None:
         """
-        发布消息到消息总线
-
-        借鉴 MetaGPT 的 publish_message
+        记录本轮输出。任务调度不经过这里，由 WorkflowExecutor 调用 run()。
         """
-        # 设置发送者
         message.sent_from = self.agent_id
-
-        # 发布到消息总线
-        if self.message_bus:
-            await self.message_bus.publish(message)
-
-        # 同时保存到记忆
         self.memory.append(message)
 
     def put_message(self, message: Message) -> None:
         """
-        直接放入本地队列（不经过消息总线）
-
-        借鉴 MetaGPT 的 put_message
+        直接放入本地队列，供后续 run() 观察。
         """
         asyncio.create_task(self.message_queue.push(message))
 

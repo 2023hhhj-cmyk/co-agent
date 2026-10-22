@@ -2,7 +2,7 @@
 # 从需求接收到项目交付的完整流程
 #
 # 流程：
-#   CEO(需求分析) → PM(PRD) → [Dev + Design](并行) → Review → Deploy → Finance
+#   CEO(需求分析) → PM(PRD) → [Dev + Design](并行) → Review → Deploy
 #
 # 借鉴 ChatDev 的图结构 + MetaGPT 的角色定义
 
@@ -20,7 +20,7 @@ graph:
   start_nodes: ["ceo"]
 
   # 终止节点
-  end_nodes: ["finance"]
+  end_nodes: ["deploy"]
 
   # 节点定义
   nodes:
@@ -87,16 +87,6 @@ graph:
           - "deploy_app"
           - "setup_monitoring"
 
-    # 财务记录
-    - id: "finance"
-      type: "agent"
-      role: "finance"
-      description: "财务人员记录项目成本和收入"
-      config:
-        actions:
-          - "record_cost"
-          - "generate_invoice"
-
   # 边定义（消息传递路径）
   edges:
     # CEO → PM：需求分析完成后，分配给产品经理
@@ -123,8 +113,3 @@ graph:
     - source: "review"
       target: "deploy"
       description: "审查通过，部署上线"
-
-    # Deploy → Finance：部署完成后，记录财务
-    - source: "deploy"
-      target: "finance"
-      description: "部署完成，记录财务"

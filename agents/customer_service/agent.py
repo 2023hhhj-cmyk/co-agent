@@ -94,7 +94,6 @@ class CustomerServiceAgent(BaseAgent):
     def __init__(
         self,
         llm_client: Optional[LLMClient] = None,
-        message_bus: Any = None,
         wecom_client: Optional[WecomClient] = None,
         db: Optional[Database] = None,
         redis_client: Any = None,
@@ -107,7 +106,6 @@ class CustomerServiceAgent(BaseAgent):
         super().__init__(
             role=CS_ROLE,
             llm_client=llm_client,
-            message_bus=message_bus,
             memory_manager=memory_manager,
             **kwargs,
         )

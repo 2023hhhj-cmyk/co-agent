@@ -23,6 +23,7 @@ class TaskStatus(str, Enum):
     COMPLETED = "completed"        # 已完成
     FAILED = "failed"              # 失败
     WAITING_DEP = "waiting_dep"    # 等待依赖完成
+    SKIPPED = "skipped"            # 前置任务失败，未执行
 
 
 class SubTaskStatus(str, Enum):
@@ -51,7 +52,7 @@ class SubTaskStatus(str, Enum):
 
 
 class SubTask:
-    """ponytail: 一个可独立调 Claude Code 执行的子任务。"""
+    """ponytail: 一个可独立调 opencode 执行的子任务。"""
 
     __slots__ = (
         "name", "desc", "deps", "status", "output_path",
@@ -91,6 +92,7 @@ class Task(BaseModel):
     dependencies: list[str] = Field(default_factory=list)  # 依赖的 task id
     status: TaskStatus = TaskStatus.PENDING
     priority: int = 2              # 1=高 2=中 3=低
+    acceptance: str = ""           # 做完要交出的产物
     result: Optional[str] = None   # 执行结果摘要
     error: Optional[str] = None    # 错误信息
     created_at: datetime = Field(default_factory=datetime.now)
@@ -109,6 +111,11 @@ class Task(BaseModel):
         self.error = error
         self.completed_at = datetime.now()
 
+    def mark_skipped(self, reason: str = ""):
+        self.status = TaskStatus.SKIPPED
+        self.error = reason
+        self.completed_at = datetime.now()
+
     def to_summary(self) -> str:
         """生成简短的状态摘要"""
         status_icon = {
@@ -118,6 +125,7 @@ class Task(BaseModel):
             TaskStatus.COMPLETED: "✅",
             TaskStatus.FAILED: "❌",
             TaskStatus.WAITING_DEP: "⏳",
+            TaskStatus.SKIPPED: "⏭️",
         }
         icon = status_icon.get(self.status, "❓")
         return f"{icon} [{self.id}] {self.title} → {self.assigned_to}"
@@ -127,9 +135,15 @@ class ProjectPlan(BaseModel):
     """项目计划"""
     id: str = Field(default_factory=lambda: uuid.uuid4().hex[:8])
     requirement: str               # 原始需求文本
+    design_doc: str = ""           # 需求文档正文
+    design_doc_path: str = ""      # 容器工作区中的需求文档路径
+    client_dir: str = ""           # 容器内工作区，/workspace
+    container_name: str = ""       # 客户长期容器
+    volume_name: str = ""          # 挂在 /workspace 的数据卷
+    container_error: str = ""      # 客户容器创建/写入失败原因，供 Developer 报出可诊断错误
     tasks: list[Task] = Field(default_factory=list)
     current_phase: str = "planning"
-    status: str = "planning"       # planning / confirmed / executing / completed / failed
+    status: str = "planning"       # planning / confirmed / executing / completed / partial / failed
     chat_id: str = ""              # 飞书会话 ID
     user_message_id: str = ""      # 触发计划的飞书消息 ID
     creator_sender_id: str = ""    # P0 #5 修复：发起计划的发送者 open_id，用于横向越权防护
@@ -194,7 +208,7 @@ class ProjectPlan(BaseModel):
     def is_all_done(self) -> bool:
         """是否所有任务都已完成"""
         return all(
-            t.status in (TaskStatus.COMPLETED, TaskStatus.FAILED)
+            t.status in (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.SKIPPED)
             for t in self.tasks
         )
 
@@ -209,20 +223,36 @@ class ProjectPlan(BaseModel):
         total = len(self.tasks)
         done = counts.get(TaskStatus.COMPLETED.value, 0)
         failed = counts.get(TaskStatus.FAILED.value, 0)
+        skipped = counts.get(TaskStatus.SKIPPED.value, 0)
         running = counts.get(TaskStatus.RUNNING.value, 0)
         waiting = counts.get(TaskStatus.WAITING_DEP.value, 0)
         lines.append(
             f"\n进度: {done}/{total} 完成, {failed} 失败, "
-            f"{running} 运行中, {waiting} 等待依赖"
+            f"{skipped} 跳过, {running} 运行中, {waiting} 等待依赖"
         )
         return "\n".join(lines)
+
+    def to_dict(self) -> dict:
+        """序列化，供 Redis 保存。包含需求文档路径、正文和验收标准。"""
+        return self.model_dump(mode="json")
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "ProjectPlan":
+        """从 Redis 数据恢复。缺字段时使用默认值。"""
+        return cls.model_validate(data)
 
     def to_confirm_card(self) -> dict:
         """生成飞书确认卡片"""
         task_lines = []
         for i, task in enumerate(self.tasks, 1):
             dep_text = f" (依赖: {', '.join(task.dependencies)})" if task.dependencies else ""
-            task_lines.append(f"{i}. **{task.title}** → {task.assigned_to}{dep_text}")
+            accept = f"\n   验收: {task.acceptance}" if task.acceptance else ""
+            task_lines.append(f"{i}. **{task.title}** → {task.assigned_to}{dep_text}{accept}")
+
+        doc = (self.design_doc or "").strip()
+        if len(doc) > 800:
+            doc = doc[:800] + "..."
+        doc_block = f"\n\n**需求文档**:\n{doc}" if doc else ""
 
         card = {
             "config": {"wide_screen_mode": True},
@@ -233,7 +263,7 @@ class ProjectPlan(BaseModel):
             "elements": [
                 {
                     "tag": "markdown",
-                    "content": f"**需求**: {self.requirement}\n\n**拆解结果**:\n" + "\n".join(task_lines),
+                    "content": f"**需求**: {self.requirement}{doc_block}\n\n**任务**:\n" + "\n".join(task_lines),
                 },
                 {"tag": "hr"},
                 {

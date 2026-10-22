@@ -2,7 +2,7 @@
 工作流图定义模型 - 借鉴 ChatDev 的图结构
 
 核心设计：
-- NodeDef: 节点定义（agent / tool / human / python_runner）
+- NodeDef: 节点定义（以 Agent 为核心执行单元）
 - EdgeDef: 有向边定义（支持条件路由）
 - GraphDef: DAG 图定义
 - WorkflowDef: 完整工作流定义（含全局变量）
@@ -14,12 +14,12 @@ from pydantic import BaseModel, Field
 
 
 class NodeType(str, Enum):
-    """节点类型"""
-    AGENT = "agent"  # LLM Agent 节点
-    TOOL = "tool"  # 工具调用节点
-    HUMAN = "human"  # 人类参与节点
-    PYTHON = "python_runner"  # Python 执行节点
-    SUBGRAPH = "subgraph"  # 子图节点
+    """节点类型（当前实际业务运行均为 AGENT，TOOL 等仅作为通用引擎底层预留）"""
+    AGENT = "agent"  # LLM Agent 节点（核心使用，工具由 Agent 内部自治调用）
+    TOOL = "tool"  # 工具调用节点（底层引擎预留扩展，当前业务流中不作为独立节点）
+    HUMAN = "human"  # 人类参与节点（预留扩展）
+    PYTHON = "python_runner"  # Python 执行节点（预留扩展）
+    SUBGRAPH = "subgraph"  # 子图节点（预留扩展）
     PASSTHROUGH = "passthrough"  # 透传节点
 
 
@@ -73,7 +73,7 @@ class GraphDef(BaseModel):
     DAG 图定义
 
     借鉴 ChatDev 的图结构：
-    - 节点代表 Agent 或工具
+    - 节点代表 Agent 执行角色（工具由各 Agent 内部自治调用，不作为独立图节点）
     - 边代表消息传递路径
     - 支持条件路由和并行执行
     """

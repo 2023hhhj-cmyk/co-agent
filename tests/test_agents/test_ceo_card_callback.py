@@ -15,7 +15,7 @@ from agents.ceo import agent as ceo_mod
 
 def _make_ceo_agent() -> CEOAgent:
     """构造一个最小可用的 CEOAgent（mock 掉所有外部依赖）"""
-    # 不走 __init__，直接构造，避免触发 BaseAgent 的 memory_manager / message_bus 注册
+    # 不走 __init__，直接构造，避免触发 BaseAgent 的 memory_manager 注册
     agent = CEOAgent.__new__(CEOAgent)
     agent.agent_id = "test-agent-id"
     agent._active_plans = {}

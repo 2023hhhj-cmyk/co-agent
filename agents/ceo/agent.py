@@ -4,9 +4,9 @@ CEO Agent - 首席执行官
 职责：
 1. 通过飞书与用户沟通，接收客户需求
 2. 理解需求，必要时追问澄清
-3. LLM 在项目模板约束内拆解任务
-4. 将拆解方案发给用户确认
-5. 确认后调度下级 Agent 执行（混合模式：简单同步、复杂异步）
+3. 根据上下文写需求文档，写入客户目录，再按文档分配任务
+4. 将需求文档和任务发给用户确认
+5. 确认后按依赖分批调度执行器，对照验收决定完成、失败或跳过
 6. 追踪进度，实时飞书通知
 
 状态机：
@@ -17,6 +17,8 @@ import asyncio
 import contextvars
 import json
 import logging
+import os
+import re
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -30,7 +32,8 @@ from channels.feishu import FeishuClient
 from models.agent import ActionDef, AgentRole, ReactMode
 from models.message import Message
 from models.task import ProjectPlan, Task, TaskStatus
-from tools.code.claude_code import ClaudeCodeTool
+from tools.code.opencode import OpenCodeTool
+from tools.deploy.customer_container import WORKSPACE_ROOT, CustomerContainers
 from tools.llm.client import LLMClient
 from tools.llm.prompt import PromptManager
 from workflows.converter import PlanToGraphConverter
@@ -93,7 +96,6 @@ class CEOAgent(BaseAgent):
     def __init__(
         self,
         llm_client: Optional[LLMClient] = None,
-        message_bus: Any = None,
         feishu_client: Optional[FeishuClient] = None,
         team: Optional[dict[str, Any]] = None,
         base_dir: str = "/root",
@@ -105,7 +107,6 @@ class CEOAgent(BaseAgent):
         super().__init__(
             role=CEO_ROLE,
             llm_client=llm_client,
-            message_bus=message_bus,
             memory_manager=memory_manager,
             **kwargs,
         )
@@ -115,14 +116,15 @@ class CEOAgent(BaseAgent):
         self.state_manager = state_manager  # 用于 _active_plans 持久化
         self.input_guard = input_guard  # 输入校验器
 
-        # Claude Code 工具（用于浏览项目代码，优先级低于项目文件）
-        self.claude_code = ClaudeCodeTool(
+        # opencode 工具（用于浏览项目代码，优先级低于项目文件）
+        self.opencode = OpenCodeTool(
             base_dir=base_dir,
             timeout=30,
         )
 
         # 加载项目模板
         self.template = self._load_template()
+        self.customer_containers = CustomerContainers()
 
         # 加载知识文件和人格文件
         self.product_doc = self._load_markdown("product.md")
@@ -295,8 +297,8 @@ class CEOAgent(BaseAgent):
             await self._send_feishu_text(chat_id, feedback)
             return
 
-        # 需求完整，拆解任务
-        await self._send_feishu_text(chat_id, "收到！正在为您拆解任务，请稍候...")
+        # 需求完整，写需求文档并分配任务
+        await self._send_feishu_text(chat_id, "收到！正在编写需求文档并安排任务，请稍候...")
 
         plan = await self._decompose_tasks(text, chat_id, message_id)
         if not plan:
@@ -358,108 +360,183 @@ class CEOAgent(BaseAgent):
     async def _decompose_tasks(
         self, requirement: str, chat_id: str, message_id: str
     ) -> Optional[ProjectPlan]:
-        """LLM 在模板约束内拆解任务"""
+        """先写需求文档，再按文档分配任务，并把文档写入客户目录。"""
         if not self.llm:
-            return self._default_plan(requirement, chat_id, message_id)
+            plan = self._default_plan(requirement, chat_id, message_id)
+            await self._write_client_design_doc(plan)
+            return plan
 
-        # 构建模板上下文
-        template_context = self._build_template_context()
+        try:
+            design_doc = await self._write_design_doc(requirement, chat_id)
+        except Exception as e:
+            logger.error(f"需求文档生成失败: {e}", exc_info=True)
+            plan = self._default_plan(requirement, chat_id, message_id)
+            await self._write_client_design_doc(plan)
+            return plan
 
-        system_prompt = f"""你是一个项目CEO。根据客户需求，拆解为可执行的子任务。你直接面对客户需求，没有产品经理，需要把模糊需求转化为 Developer 能直接执行的详细描述。
+        try:
+            tasks = await self._allocate_tasks(requirement, design_doc)
+        except Exception as e:
+            logger.error(f"任务调配失败: {e}", exc_info=True)
+            tasks = None
 
-## 项目模板
-{template_context}
+        if not tasks:
+            logger.warning("任务调配没有产出，使用默认的单项开发任务")
+            plan = self._default_plan(requirement, chat_id, message_id)
+            plan.design_doc = design_doc or plan.design_doc
+        else:
+            plan = ProjectPlan(
+                requirement=requirement,
+                design_doc=design_doc,
+                tasks=tasks,
+                chat_id=chat_id,
+                user_message_id=message_id,
+            )
+        await self._write_client_design_doc(plan)
+        return plan
 
-## 拆解规则
-- 每个阶段至少有一个任务
-- 必须覆盖所有 required_agents
-- optional_agents 根据需求决定是否参与
-- 通过 dependencies 定义任务依赖关系
-- 下一阶段的任务依赖上一阶段的任务完成
+    def _planning_context(self, chat_id: str) -> str:
+        """写文档时带上公司资料和这个会话里已有的计划。"""
+        parts = []
+        if getattr(self, "product_doc", ""):
+            parts.append(f"## 公司与产品\n{self.product_doc[:4000]}")
+        existing = getattr(self, "_active_plans", {}).get(chat_id)
+        if existing is not None:
+            if existing.design_doc:
+                parts.append(f"## 当前需求文档\n{existing.design_doc[:2000]}")
+            elif existing.requirement:
+                parts.append(f"## 当前需求\n{existing.requirement[:1000]}")
+        return "\n\n".join(parts)
 
-## 给 Developer 的任务描述要求（最重要！）
-Developer 使用 Claude Code 构建产品，它需要清晰的输入。给 Developer 的 description 必须包含：
-1. 要做什么：一句话概括产品
-2. 目标用户：给谁用的
-3. 功能清单：列出所有需要实现的功能点
-4. 页面/模块结构：有哪些页面或模块，各自的作用
-5. 技术要求：技术栈偏好、部署方式等（如有）
-6. 参考：客户提到的参考样式或竞品（如有）
+    async def _write_design_doc(self, requirement: str, chat_id: str) -> str:
+        """根据这次需求和已有上下文写需求文档。"""
+        context = self._planning_context(chat_id)
+        system_prompt = """你是项目 CEO。根据客户需求和给出的上下文，写一份需求文档。
 
-## 输出格式
+文档用 Markdown，包含：
+- 要做什么
+- 给谁用
+- 功能与模块
+- 约束（技术、范围、不做的事）
+
+只写文档正文，不要输出任务列表，也不要派给某个角色。信息不足时按上下文做合理约定，并在文档里标明这是约定。"""
+        user = f"客户需求：\n{requirement}"
+        if context:
+            user = f"{user}\n\n已有上下文：\n{context}"
+        response = await self.llm.chat(
+            [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user},
+            ],
+            temperature=0.3,
+            max_tokens=2000,
+        )
+        return (response or "").strip() or f"# 需求文档\n\n{requirement.strip()}\n"
+
+    async def _allocate_tasks(self, requirement: str, design_doc: str) -> list[Task]:
+        """只按需求文档里真正要做的事分配任务。"""
+        system_prompt = f"""你是项目 CEO。需求文档已经写好。请只为文档里真正需要的工作建立任务。
+
+## 可分配角色
+{self._build_template_context()}
+
+## 规则
+- 一项任务只做一件事，交给一个角色
+- 文档没有前端工作就不派 frontend_expert，没有部署就不派 devops
+- 不要为了凑阶段而增加任务
+- dependencies 填写其他任务的 title；没有依赖则为 []
+- 每个 title 必须唯一
+- acceptance 写明做完要交出的产物，例如某个文件或可运行结果
+
 严格输出 JSON，不要包含其他文本：
 {{
   "tasks": [
     {{
       "title": "任务标题",
-      "description": "具体要做什么",
-      "assigned_to": "agent_role_name",
+      "description": "这一项要做什么",
+      "assigned_to": "developer",
       "dependencies": [],
-      "priority": 2
+      "priority": 2,
+      "acceptance": "做完要交出的产物"
     }}
   ]
 }}
 
-## 重要规则
-- assigned_to 可选值：developer, frontend_expert, devops, finance
-- dependencies 必须填写其他任务的 title（不是 id，不是序号），例如：["开发后端API", "做前端页面"]
-- 如果没有依赖，dependencies 为 []
-- 每个任务的 title 必须唯一"""
-
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"客户需求：{requirement}"},
-        ]
-
-        try:
-            response = await self.llm.chat(messages, temperature=0.3, max_tokens=2000)
-            tasks_data = self._parse_tasks_json(response)
-
-            if not tasks_data:
-                logger.warning("LLM 返回的任务数据解析失败，使用默认方案")
-                return self._default_plan(requirement, chat_id, message_id)
-
-            tasks = []
-            for td in tasks_data:
-                task = Task(
-                    title=td.get("title", "未命名任务"),
-                    description=td.get("description", ""),
-                    assigned_to=td.get("assigned_to", "developer"),
-                    dependencies=td.get("dependencies", []),
-                    priority=td.get("priority", 2),
-                )
-                tasks.append(task)
-
-            plan = ProjectPlan(
-                requirement=requirement,
-                tasks=tasks,
-                chat_id=chat_id,
-                user_message_id=message_id,
-            )
-            return plan
-
-        except Exception as e:
-            logger.error(f"任务拆解失败: {e}", exc_info=True)
-            return self._default_plan(requirement, chat_id, message_id)
+assigned_to 只能是 developer、frontend_expert、devops。"""
+        response = await self.llm.chat(
+            [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": f"原始需求：\n{requirement}\n\n需求文档：\n{design_doc}"},
+            ],
+            temperature=0.3,
+            max_tokens=2000,
+        )
+        tasks_data = self._parse_tasks_json(response)
+        if not tasks_data:
+            return []
+        allowed = {"developer", "frontend_expert", "devops"}
+        tasks = []
+        for td in tasks_data:
+            role = td.get("assigned_to", "developer")
+            if role not in allowed:
+                role = "developer"
+            tasks.append(Task(
+                title=td.get("title", "未命名任务"),
+                description=td.get("description", ""),
+                assigned_to=role,
+                dependencies=td.get("dependencies") or [],
+                priority=td.get("priority", 2),
+                acceptance=td.get("acceptance", ""),
+            ))
+        return tasks
 
     def _build_template_context(self) -> str:
-        """构建模板上下文文本"""
+        """角色能力目录。不包含固定阶段。"""
         lines = []
-
-        for phase in self.template.get("phases", []):
-            lines.append(f"### {phase['name']}")
-            lines.append(f"- 必须参与: {', '.join(phase.get('required_agents', []))}")
-            if phase.get("optional_agents"):
-                lines.append(f"- 可选参与: {', '.join(phase['optional_agents'])}")
-            lines.append(f"- 说明: {phase.get('description', '')}")
-            lines.append(f"- 可并行: {'是' if phase.get('can_parallel') else '否'}")
-            lines.append("")
-
-        lines.append("### Agent 能力")
         for role, info in self.template.get("agent_capabilities", {}).items():
-            lines.append(f"- **{info.get('name', role)}** ({role}): {info.get('capabilities', '')}")
-
+            capability = " ".join((info.get("capabilities") or "").split())
+            lines.append(
+                f"- {role}（{info.get('name', role)}）：{capability} 交付：{info.get('output', '')}"
+            )
         return "\n".join(lines)
+
+    def _client_label(self, requirement: str, chat_id: str) -> str:
+        """客户目录名。优先用需求里写明的客户，否则用会话标识。"""
+        raw = ""
+        for pattern in (r"公司[：:]\s*(\S+)", r"客户[：:]\s*(\S+)", r"项目[：:]\s*(\S+)"):
+            match = re.search(pattern, requirement or "")
+            if match:
+                raw = match.group(1)
+                break
+        if not raw:
+            raw = f"client_{chat_id}" if chat_id else f"client_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        safe = re.sub(r"[^\w一-鿿-]", "_", raw)
+        safe = re.sub(r"_+", "_", safe).strip("_")
+        return (safe or "unnamed_client")[:64]
+
+    async def _write_client_design_doc(self, plan: ProjectPlan) -> None:
+        """为客户创建一个长期容器，并把需求文档写入容器里的 /workspace。"""
+        label = self._client_label(plan.requirement, plan.chat_id)
+        api = getattr(self, "customer_containers", None) or CustomerContainers()
+        self.customer_containers = api
+        text = (plan.design_doc or "").strip() or f"# 需求文档\n\n{plan.requirement.strip()}\n"
+        try:
+            workspace = await api.ensure(label)
+            path = f"{WORKSPACE_ROOT}/需求文档.md"
+            await api.write_file(workspace.container_name, path, text)
+            plan.container_name = workspace.container_name
+            plan.volume_name = workspace.volume_name
+            plan.client_dir = workspace.workspace
+            plan.design_doc_path = path
+            plan.design_doc = text
+            plan.container_error = ""
+        except Exception as exc:
+            logger.warning(f"客户容器创建或需求文档写入失败: {exc}")
+            plan.container_name = ""
+            plan.volume_name = ""
+            plan.client_dir = ""
+            plan.design_doc_path = ""
+            plan.container_error = str(exc)[:300]
 
     def _parse_tasks_json(self, response: str) -> Optional[list[dict]]:
         """解析 LLM 返回的任务 JSON"""
@@ -484,20 +561,19 @@ Developer 使用 Claude Code 构建产品，它需要清晰的输入。给 Devel
     def _default_plan(
         self, requirement: str, chat_id: str, message_id: str
     ) -> ProjectPlan:
-        """生成默认任务方案（LLM 不可用时的回退）"""
+        """LLM 不可用时：保留需求原文，只派一项开发任务。"""
+        doc = f"# 需求文档\n\n{requirement.strip()}\n"
         tasks = [
-            Task(title="设计与开发", description=requirement, assigned_to="developer"),
-            Task(title="前端页面", description="设计并实现高质量前端页面", assigned_to="frontend_expert"),
-            Task(title="部署上线", description="部署到生产环境", assigned_to="devops", dependencies=[]),
-            Task(title="财务结算", description="记录成本，生成账单", assigned_to="finance", dependencies=[]),
+            Task(
+                title="实现需求",
+                description=requirement,
+                assigned_to="developer",
+                acceptance="在客户目录中交付可运行的结果",
+            ),
         ]
-
-        # 设置依赖关系
-        tasks[2].dependencies = [tasks[0].id]  # 部署依赖开发
-        tasks[3].dependencies = [tasks[2].id]  # 财务依赖部署
-
         return ProjectPlan(
             requirement=requirement,
+            design_doc=doc,
             tasks=tasks,
             chat_id=chat_id,
             user_message_id=message_id,
@@ -550,82 +626,171 @@ Developer 使用 Claude Code 构建产品，它需要清晰的输入。给 Devel
 
     async def _execute_plan(self, chat_id: str, plan: ProjectPlan) -> None:
         """
-        执行任务计划
+        按依赖分批执行。
 
-        流程：
-        1. 把 ProjectPlan 转成动态 DAG（PlanToGraphConverter）
-        2. 创建 WorkflowExecutor，注入进度回调
-        3. 执行 DAG，各 Agent 由 Executor 调度
-        4. 汇总报告
-        5. 归档项目记忆
+        CEO 决定每一批派哪些任务，并对照验收标记完成、失败或跳过。
+        执行器只调用被点名的 Agent，不跑完整张图。
         """
         plan.status = "executing"
+        execution_error = None
         await self._send_feishu_text(chat_id, "✅ 已确认！开始执行任务...")
+        executor = None
+        context: dict[str, Any] = {"outputs": {}}
 
         try:
-            # 1. ProjectPlan → 动态 DAG
-            converter = PlanToGraphConverter()
-            graph_def = converter.convert(plan)
-            graph = WorkflowGraph(graph_def)
-
-            # 2. 构建额外上下文（任务描述 + 元数据）
-            extra_context = {
-                "task_descriptions": {t.id: t.description for t in plan.tasks},
-                "task_metadata": {
-                    t.id: {
-                        "plan_id": plan.id,
-                        "task_id": t.id,
-                        "task_title": t.title,
-                        "requirement": plan.requirement,
-                    }
-                    for t in plan.tasks
-                },
+            graph = WorkflowGraph(PlanToGraphConverter().convert(plan))
+            executor = WorkflowExecutor(graph=graph, agents=self.team)
+            context = {
+                "outputs": {},
+                "task_descriptions": {},
+                "task_metadata": {},
             }
-
-            # 3. 进度回调：每完成一个节点，更新 plan 并通知飞书
-            async def on_progress(node_id: str, result: Message) -> None:
-                task = plan.get_task(node_id)
-                if task:
-                    result_text = result.content if result else "任务已完成"
-                    task.mark_completed(result_text[:500])
-                    await self._send_feishu_text(chat_id, f"✅ 任务 [{task.title}] 已完成")
-
-            # 4. 创建 Executor 并执行
-            executor = WorkflowExecutor(
-                graph=graph,
-                agents=self.team,
-                on_progress=on_progress,
-            )
-
             input_message = Message(
                 content=plan.requirement,
                 cause_by="user_requirement",
                 sent_from="user",
                 send_to={"*"},
             )
-
-            await executor.execute(input_message, extra_context=extra_context)
-
+            executor.open_run()
+            depth = 0
+            while True:
+                ready, skipped_now = self._next_batch(plan, graph, context)
+                if not ready and not skipped_now:
+                    break
+                if not ready:
+                    continue
+                self._fill_assignment(plan, ready, context)
+                await executor.dispatch(
+                    [task.id for task in ready],
+                    input_message,
+                    context,
+                    depth=depth,
+                )
+                depth += 1
+                for task in ready:
+                    await self._settle_task(chat_id, plan, task, context)
         except Exception as e:
+            execution_error = str(e)
             logger.error(f"工作流执行失败: {e}", exc_info=True)
+            if executor is not None:
+                executor.close_run(context, failed=True)
+                executor = None
             await self._send_feishu_text(chat_id, f"⚠️ 执行过程中出现问题: {str(e)[:200]}")
+        else:
+            if executor is not None:
+                executor.close_run(context)
 
-        # 5. 标记失败的任务
         for task in plan.tasks:
-            if task.status == TaskStatus.RUNNING:
-                task.mark_failed("执行未完成")
+            if task.status not in (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.SKIPPED):
+                task.mark_failed(execution_error or "执行未完成")
 
-        # 6. 汇总报告
-        plan.status = "completed"
+        completed = sum(task.status == TaskStatus.COMPLETED for task in plan.tasks)
+        if plan.tasks and completed == len(plan.tasks) and execution_error is None:
+            plan.status = "completed"
+        else:
+            plan.status = "partial" if completed else "failed"
         plan.completed_at = datetime.now()
 
-        # 7. 归档项目记忆到三层记忆系统
         await self._archive_project_memory(chat_id, plan)
-
-        # 8. 清理持久化的 active_plan
         await self._clear_active_plan(chat_id)
-
         await self._send_completion_report(chat_id, plan)
+
+    def _next_batch(self, plan: ProjectPlan, graph: WorkflowGraph, context: dict) -> tuple[list[Task], list[Task]]:
+        """找出依赖已满足的任务；前置失败的任务直接跳过。"""
+        ready: list[Task] = []
+        skipped: list[Task] = []
+        outputs = context["outputs"]
+        for task in plan.tasks:
+            if task.status in (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.SKIPPED):
+                continue
+            parents = list(graph.reverse_adj[task.id])
+            if any(parent not in outputs for parent in parents):
+                continue
+            blocked = [
+                parent for parent in parents
+                if isinstance(outputs.get(parent), dict) and "error" in outputs[parent]
+            ]
+            if blocked:
+                reason = f"前置任务失败或被跳过: {', '.join(blocked)}"
+                task.mark_skipped(reason)
+                outputs[task.id] = {"error": reason, "skipped": True, "blocked_by": blocked}
+                skipped.append(task)
+            else:
+                ready.append(task)
+        return ready, skipped
+
+    def _fill_assignment(self, plan: ProjectPlan, ready: list[Task], context: dict) -> None:
+        """把需求文档、验收标准和上游产物放进这一批任务的消息。"""
+        outputs = context["outputs"]
+        for task in ready:
+            upstream = []
+            for parent_id in task.dependencies:
+                parent = self._resolve_task(plan, parent_id)
+                if parent is None:
+                    continue
+                raw = outputs.get(parent.id, {})
+                content = raw.get("content", "") if isinstance(raw, dict) else ""
+                if content:
+                    upstream.append(f"- {parent.title}: {content[:300]}")
+            lines = [task.description]
+            if task.acceptance:
+                lines.append(f"\n验收：{task.acceptance}")
+            if plan.design_doc_path:
+                lines.append(f"需求文档：{plan.design_doc_path}")
+            elif plan.design_doc:
+                lines.append(f"需求文档：\n{plan.design_doc[:2000]}")
+            if upstream:
+                lines.append("上游产物：\n" + "\n".join(upstream))
+            context["task_descriptions"][task.id] = "\n".join(lines)
+            context["task_metadata"][task.id] = {
+                "plan_id": plan.id,
+                "task_id": task.id,
+                "task_title": task.title,
+                "requirement": plan.requirement,
+                "acceptance": task.acceptance,
+                "design_doc_path": plan.design_doc_path,
+                "client_dir": plan.client_dir,
+                "container_name": plan.container_name,
+                "volume_name": plan.volume_name,
+                "container_error": plan.container_error,
+                "upstream": upstream,
+            }
+
+    def _resolve_task(self, plan: ProjectPlan, ref: str) -> Optional[Task]:
+        task = plan.get_task(ref)
+        if task:
+            return task
+        for item in plan.tasks:
+            if item.title == ref:
+                return item
+        return None
+
+    def _meets_acceptance(self, task: Task, output: dict) -> tuple[bool, str]:
+        """对照验收标准判断这项任务是否完成。"""
+        if output.get("cause_by") == "error":
+            return False, (output.get("content") or "任务返回错误")[:500]
+        content = (output.get("content") or "").strip()
+        acceptance = (task.acceptance or "").strip()
+        if acceptance and not content:
+            return False, f"未满足验收：{acceptance}"
+        return True, ""
+
+    async def _settle_task(self, chat_id: str, plan: ProjectPlan, task: Task, context: dict) -> None:
+        output = context["outputs"].get(task.id)
+        if not isinstance(output, dict):
+            task.mark_failed("无输出")
+            context["outputs"][task.id] = {"error": "无输出"}
+            return
+        if "error" in output:
+            task.mark_failed(str(output["error"]))
+            return
+        ok, reason = self._meets_acceptance(task, output)
+        if ok:
+            task.mark_completed((output.get("content") or "")[:500])
+            await self._send_feishu_text(chat_id, f"✅ 任务 [{task.title}] 已完成")
+            return
+        task.mark_failed(reason)
+        context["outputs"][task.id] = {"error": reason, "content": output.get("content", "")}
 
     # ========== 进度查询 ==========
 
@@ -654,7 +819,7 @@ Developer 使用 Claude Code 构建产品，它需要清晰的输入。给 Devel
             return
 
         # 重新拆解
-        await self._send_feishu_text(chat_id, "好的，正在根据您的反馈重新拆解任务...")
+        await self._send_feishu_text(chat_id, "好的，正在根据您的反馈重写需求文档并安排任务...")
         new_plan = await self._decompose_tasks(
             f"原始需求：{plan.requirement}\n\n用户反馈：{text}",
             chat_id,
@@ -842,9 +1007,15 @@ Developer 使用 Claude Code 构建产品，它需要清晰的输入。给 Devel
         total = len(plan.tasks)
         completed = sum(1 for t in plan.tasks if t.status == TaskStatus.COMPLETED)
         failed = sum(1 for t in plan.tasks if t.status == TaskStatus.FAILED)
+        skipped = sum(1 for t in plan.tasks if t.status == TaskStatus.SKIPPED)
 
+        heading = {
+            "completed": "🎉 项目完成！",
+            "partial": "⚠️ 项目部分完成，存在失败任务。",
+            "failed": "❌ 项目执行失败。",
+        }.get(plan.status, "⚠️ 项目执行已结束，请检查任务状态。")
         report_lines = [
-            f"🎉 项目完成！",
+            heading,
             f"",
             f"需求: {plan.requirement[:100]}",
             f"",
@@ -853,10 +1024,13 @@ Developer 使用 Claude Code 构建产品，它需要清晰的输入。给 Devel
 
         for task in plan.tasks:
             report_lines.append(task.to_summary())
+            if task.status in (TaskStatus.FAILED, TaskStatus.SKIPPED) and task.error:
+                label = "跳过原因" if task.status == TaskStatus.SKIPPED else "失败原因"
+                report_lines.append(f"  {label}: {task.error[:200]}")
 
         report_lines.extend([
             f"",
-            f"总计: {total} 个任务, {completed} 完成, {failed} 失败",
+            f"总计: {total} 个任务, {completed} 完成, {failed} 失败, {skipped} 跳过",
         ])
 
         # 汇总各 Agent 的产出
@@ -950,6 +1124,7 @@ Developer 使用 Claude Code 构建产品，它需要清晰的输入。给 Devel
                     "task_count": len(plan.tasks),
                     "completed_count": sum(1 for t in plan.tasks if t.status == TaskStatus.COMPLETED),
                     "failed_count": sum(1 for t in plan.tasks if t.status == TaskStatus.FAILED),
+                    "skipped_count": sum(1 for t in plan.tasks if t.status == TaskStatus.SKIPPED),
                     "completed_at": plan.completed_at.isoformat() if plan.completed_at else "",
                 },
             )
@@ -978,8 +1153,8 @@ Developer 使用 Claude Code 构建产品，它需要清晰的输入。给 Devel
         """
         思考阶段
 
-        CEO 的主要逻辑已迁移到 handle_feishu_message，
-        此方法处理来自内部 MessageBus 的消息（如 Agent 完成通知）。
+        CEO 的主要逻辑在 handle_feishu_message。
+        这里处理经 run() 传入的消息，例如任务完成通知。
         """
         if not messages:
             return None

@@ -12,6 +12,7 @@ import logging
 import time
 from typing import Any, Dict, List, Optional
 
+from acceleration.limits import get_workspace_task_slots
 from models.message import Message
 from models.workflow import NodeType
 from workflows.graph import WorkflowGraph
@@ -155,6 +156,10 @@ class WorkflowExecutor:
             NodeType.AGENT.value: AgentNodeExecutor(self.agents, self.graph),
             NodeType.PASSTHROUGH.value: PassthroughNodeExecutor(),
         }
+        self._run_id = ""
+        self._run_started = 0.0
+        self._run_node_count = 0
+        self._run_closed = False
 
     def register_executor(self, node_type: str, executor: NodeExecutor) -> None:
         """注册节点执行器"""
@@ -171,12 +176,22 @@ class WorkflowExecutor:
 
         Args:
             input_message: 输入消息
-            max_parallel: 最大并行数
+            max_parallel: 本工作流并发上限，同时受工作区共享上限约束
             extra_context: 额外上下文（如 CEO 拆解的任务描述和元数据）
 
         Returns:
             执行上下文（包含所有节点的输出）
         """
+        if max_parallel < 1:
+            raise ValueError("max_parallel must be positive")
+        local_slots = asyncio.Semaphore(max_parallel)
+
+        async def run_node(node_id, message, context, **trace):
+            # Acquire local capacity first, so local waiters do not hold workspace slots.
+            async with local_slots:
+                async with get_workspace_task_slots():
+                    return await self._execute_node_traced(node_id, message, context, **trace)
+
         logger.info(f"Starting workflow execution: {self.graph.id}")
 
         # 拓扑排序
@@ -210,7 +225,20 @@ class WorkflowExecutor:
                 _parallel_count = len(layer)
                 tasks = []
                 for node_id in layer:
-                    task = self._execute_node_traced(
+                    blocked_by = [
+                        parent for parent in self.graph.reverse_adj[node_id]
+                        if "error" in context["outputs"].get(parent, {})
+                    ]
+                    if blocked_by:
+                        reason = f"前置任务失败或被跳过: {', '.join(blocked_by)}"
+                        context["outputs"][node_id] = {
+                            "error": reason,
+                            "skipped": True,
+                            "blocked_by": blocked_by,
+                        }
+                        logger.warning(f"Node {node_id} skipped: {reason}")
+                        continue
+                    task = run_node(
                         node_id, input_message, context,
                         depth=layer_idx, parallel_count=_parallel_count,
                         workflow_id=_workflow_id,
@@ -272,6 +300,88 @@ class WorkflowExecutor:
                        total_nodes=_node_count, success_nodes=0,
                        duration_s=round(time.time() - _wf_start, 3))
             raise
+
+    def open_run(self) -> None:
+        """CEO 开始控制一轮执行时记一次 workflow.start。"""
+        layers = self.graph.topological_sort()
+        self._run_id = getattr(self.graph, "id", None) or "wf-unknown"
+        self._run_node_count = sum(len(layer) for layer in layers)
+        self._run_started = time.time()
+        self._run_closed = False
+        emit_event(
+            "workflow.start",
+            workflow_id=self._run_id,
+            node_count=self._run_node_count,
+            topo_depth=len(layers),
+        )
+
+    def close_run(self, context: Dict[str, Any], failed: bool = False) -> None:
+        """整轮结束时记一次 workflow.end。重复调用不再发事件。"""
+        if self._run_closed:
+            return
+        self._run_closed = True
+        if failed:
+            status, success_n = "fail", 0
+        else:
+            success_n = sum(
+                1 for value in context.get("outputs", {}).values()
+                if not (isinstance(value, dict) and "error" in value)
+            )
+            total = self._run_node_count
+            if success_n == total and total > 0:
+                status = "success"
+            elif success_n == 0:
+                status = "fail"
+            else:
+                status = "partial"
+        emit_event(
+            "workflow.end",
+            workflow_id=self._run_id or "wf-unknown",
+            status=status,
+            total_nodes=self._run_node_count,
+            success_nodes=success_n,
+            duration_s=round(time.time() - self._run_started, 3),
+        )
+
+    async def dispatch(
+        self,
+        node_ids: List[str],
+        input_message: Message,
+        context: Dict[str, Any],
+        max_parallel: int = 5,
+        depth: int = 0,
+    ) -> None:
+        """只执行 CEO 点名的节点，把结果写回 context。不决定下一批任务。"""
+        if not node_ids:
+            return
+        if max_parallel < 1:
+            raise ValueError("max_parallel must be positive")
+        local_slots = asyncio.Semaphore(max_parallel)
+        workflow_id = self._run_id or (getattr(self.graph, "id", None) or "wf-unknown")
+
+        async def run_node(node_id: str) -> Message:
+            async with local_slots:
+                async with get_workspace_task_slots():
+                    return await self._execute_node_traced(
+                        node_id,
+                        input_message,
+                        context,
+                        depth=depth,
+                        parallel_count=len(node_ids),
+                        workflow_id=workflow_id,
+                    )
+
+        tasks = [(node_id, run_node(node_id)) for node_id in node_ids]
+        results = await asyncio.gather(
+            *[task for _, task in tasks],
+            return_exceptions=True,
+        )
+        for (node_id, _), result in zip(tasks, results):
+            if isinstance(result, Exception):
+                logger.error(f"Node {node_id} failed: {result}")
+                context["outputs"][node_id] = {"error": str(result)}
+            else:
+                context["outputs"][node_id] = result.to_dict()
 
     async def _execute_node_traced(
         self,
