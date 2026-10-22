@@ -24,3 +24,10 @@ htmlcov/
 .pytest_cache/
 .code-review-graph/
 coverage.xml
+
+# 本地日志与验证产物
+/tests/artifacts/
+
+# 本地工具配置（不入库）
+.claude/settings.local.json
+.vscode/
