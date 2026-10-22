@@ -2,7 +2,7 @@
 部署工具包 - DevOps Agent 的核心工具
 
 包含：
-- analyzer: 项目分析器（使用 Claude Code）
+- analyzer: 项目分析器（使用 opencode）
 - cache: 缓存管理器
 - docker: Docker 操作封装
 - monitor: 健康检查和监控

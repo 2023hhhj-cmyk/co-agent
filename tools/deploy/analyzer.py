@@ -1,5 +1,5 @@
 """
-项目分析器 - 使用 Claude Code 智能分析项目目录
+项目分析器 - 使用 opencode 智能分析项目目录
 
 核心功能：
 - 识别项目类型和技术栈
@@ -16,7 +16,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Optional
 
-from tools.code.claude_code import ClaudeCodeTool, ClaudeCodeResult
+from tools.code.opencode import OpenCodeTool, OpenCodeResult
 from tools.deploy.cache import CacheManager
 
 try:
@@ -48,18 +48,18 @@ class ProjectAnalyzer:
     """
     项目分析器
 
-    使用 Claude Code 智能分析项目目录，生成容器化配置。
+    使用 opencode 智能分析项目目录，生成容器化配置。
     """
 
-    def __init__(self, claude_code: Optional[ClaudeCodeTool] = None, use_cache: bool = True):
+    def __init__(self, opencode: Optional[OpenCodeTool] = None, use_cache: bool = True):
         """
         初始化分析器
 
         Args:
-            claude_code: Claude Code 工具实例，如果为 None 则创建新实例
+            opencode: opencode 工具实例，如果为 None 则创建新实例
             use_cache: 是否使用缓存
         """
-        self.claude_code = claude_code or ClaudeCodeTool(timeout=600)
+        self.opencode = opencode or OpenCodeTool(timeout=600)
         self.use_cache = use_cache
         self.cache = CacheManager() if use_cache else None
 
@@ -98,8 +98,8 @@ class ProjectAnalyzer:
             # 构建任务描述
             task = self._build_task()
 
-            # 调用 Claude Code 分析
-            result = await self.claude_code.execute(
+            # 调用 opencode 分析
+            result = await self.opencode.execute(
                 task=task,
                 working_dir=project_dir,
             )
@@ -163,8 +163,8 @@ class ProjectAnalyzer:
 3. compose: 端口映射用 {{PORT}}，重启策略 unless-stopped
 4. 如果已有 Dockerfile 可直接使用"""
 
-    def _parse_result(self, result: ClaudeCodeResult) -> ProjectInfo:
-        """解析 Claude Code 的输出"""
+    def _parse_result(self, result: OpenCodeResult) -> ProjectInfo:
+        """解析 opencode 的输出"""
         output = result.output or ""
 
         # 尝试从输出中提取 JSON
@@ -217,7 +217,7 @@ class ProjectAnalyzer:
         return None
 
     def generate_default_dockerfile(self, project_type: str, port: int = 8000) -> str:
-        """生成默认的 Dockerfile（当 Claude Code 分析失败时使用）"""
+        """生成默认的 Dockerfile（当 opencode 分析失败时使用）"""
         if project_type == "node":
             return f"""FROM node:18-alpine
 
