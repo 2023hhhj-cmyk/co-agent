@@ -9,12 +9,18 @@ LLM 客户端封装
 
 import json
 import logging
+import math
+import random
+from asyncio import sleep
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from abc import ABC, abstractmethod
 from typing import Any, Dict, List, Optional, Union
 
 import httpx
 
 from config.settings import settings
+from tools.llm.rate_limit import get_llm_rate_limiter
 
 logger = logging.getLogger(__name__)
 
@@ -92,15 +98,80 @@ class LLMClient(ABC):
             self._last_usage = {}
             return cached
 
-        # 调实际 API
-        try:
-            result = await self._chat_impl(messages, temperature, max_tokens, **kwargs)
-            await self._store_cache(messages, temperature, result, success=True)
-            return result
-        except Exception:
-            await self._store_cache(messages, temperature, "", success=False)
-            self._last_usage = {}
-            raise
+        if max_tokens < 1:
+            raise ValueError("max_tokens must be positive")
+        # Conservative text estimate, including tools/kwargs and message framing.
+        # This is a UTF-8 byte bound estimate, not the provider's exact tokenizer.
+        payload = {"model": self.model, "messages": messages, **kwargs}
+        estimated_input = len(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
+        estimated_input += 32 * len(messages)
+        limiter = get_llm_rate_limiter()
+        for attempt in range(settings.LLM_MAX_RETRIES + 1):
+            # Every attempt, including retries, must acquire RPM/TPM budget.
+            reservation = await limiter.acquire(estimated_input + max_tokens)
+            actual_tokens = None
+            retry_error = None
+            try:
+                result = await self._chat_impl(messages, temperature, max_tokens, **kwargs)
+                # Snapshot immediately: clients are shared by concurrent requests.
+                usage = dict(self._last_usage)
+                if "total_tokens" in usage:
+                    actual_tokens = usage["total_tokens"]
+                elif "prompt_tokens" in usage and "completion_tokens" in usage:
+                    actual_tokens = usage["prompt_tokens"] + usage["completion_tokens"]
+            except Exception as exc:
+                self._last_usage = {}
+                if attempt >= settings.LLM_MAX_RETRIES or not self._is_retryable(exc):
+                    raise
+                retry_error = exc
+            except BaseException:
+                self._last_usage = {}
+                raise
+            finally:
+                # Unknown usage retains its reservation, even on cancellation.
+                await limiter.finish(reservation, actual_tokens)
+
+            if retry_error is None:
+                await self._store_cache(messages, temperature, result, success=True)
+                return result
+
+            delay = self._retry_delay(retry_error, attempt)
+            # Never log request headers, body or exception text containing credentials.
+            logger.warning(
+                "LLM transient failure (%s), retry %d/%d in %.2fs",
+                type(retry_error).__name__, attempt + 1, settings.LLM_MAX_RETRIES, delay,
+            )
+            await sleep(delay)
+
+    @staticmethod
+    def _is_retryable(exc: Exception) -> bool:
+        if isinstance(exc, httpx.HTTPStatusError):
+            return exc.response.status_code in {408, 429, 500, 502, 503, 504, 529}
+        return isinstance(exc, (httpx.TimeoutException, httpx.NetworkError,
+                                httpx.RemoteProtocolError))
+
+    @staticmethod
+    def _retry_delay(exc: Exception, attempt: int) -> float:
+        base = min(settings.LLM_RETRY_MAX_DELAY,
+                   settings.LLM_RETRY_BASE_DELAY * 2 ** attempt)
+        delay = min(settings.LLM_RETRY_MAX_DELAY, base + random.uniform(0, base * 0.25))
+        if isinstance(exc, httpx.HTTPStatusError):
+            header = exc.response.headers.get("Retry-After")
+            if header:
+                try:
+                    retry_after = float(header)
+                except ValueError:
+                    try:
+                        deadline = parsedate_to_datetime(header)
+                        if deadline.tzinfo is None:
+                            deadline = deadline.replace(tzinfo=timezone.utc)
+                        retry_after = (deadline - datetime.now(timezone.utc)).total_seconds()
+                    except (ValueError, TypeError, OverflowError):
+                        retry_after = 0
+                if math.isfinite(retry_after):
+                    # Provider's minimum wait takes precedence over our backoff ceiling.
+                    delay = max(delay, retry_after)
+        return delay
 
     @abstractmethod
     async def _chat_impl(

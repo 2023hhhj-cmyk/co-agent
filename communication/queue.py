@@ -21,6 +21,7 @@ from typing import Any, Callable, Optional
 
 import redis.asyncio as redis
 
+from acceleration.limits import get_workspace_task_slots
 from models.customer import QueuedMessage
 
 logger = logging.getLogger(__name__)
@@ -185,6 +186,7 @@ class QueueWorker:
     async def _safe_handle(self, message: QueuedMessage) -> None:
         """安全处理单条消息（捕获异常不影响其他消息）"""
         try:
-            await self.handler(message)
+            async with get_workspace_task_slots():
+                await self.handler(message)
         except Exception as e:
             logger.error(f"处理消息失败: customer={message.customer_id}, error={e}", exc_info=True)

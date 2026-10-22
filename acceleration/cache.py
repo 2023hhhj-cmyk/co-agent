@@ -129,7 +129,7 @@ class EmbeddingCache:
         h = hashlib.sha256(f"{text}|{model_name}".encode()).hexdigest()[:32]
         return f"embed:cache:{h}"
 
-    async def get(self, text: str, model_name: str = "all-MiniLM-L6-v2") -> Optional[list]:
+    async def get(self, text: str, model_name: str = "text-embedding-v4") -> Optional[list]:
         """获取缓存的嵌入向量"""
         if not self.redis:
             return None
@@ -143,7 +143,7 @@ class EmbeddingCache:
             logger.warning(f"嵌入缓存读取失败: {e}")
         return None
 
-    async def set(self, text: str, vector: list, model_name: str = "all-MiniLM-L6-v2") -> bool:
+    async def set(self, text: str, vector: list, model_name: str = "text-embedding-v4") -> bool:
         """缓存嵌入向量"""
         if not self.redis:
             return False
