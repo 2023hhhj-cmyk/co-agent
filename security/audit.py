@@ -7,7 +7,7 @@ AuditLogger — 审计日志系统
 - input_rejected: InputGuard 拒绝的输入
 - task_executed: Agent 执行任务
 - llm_call: LLM API 调用
-- file_access: ClaudeCodeTool 文件操作
+- file_access: OpenCodeTool 文件操作
 - deploy: DevOps 部署操作
 - auth_failure: 权限校验失败
 - memory_access: 记忆系统操作

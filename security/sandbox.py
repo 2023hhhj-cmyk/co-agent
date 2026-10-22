@@ -1,275 +1,261 @@
-"""
-SandboxedExecutor — Docker 沙箱执行器
-
-限制 Claude Code 子进程的资源访问：
-- Docker 容器隔离（优先）
-- 降级模式：仅允许只读操作
-
-资源限制：
-| 资源   | 限制        |
-|--------|------------|
-| CPU    | 1 核       |
-| 内存   | 512MB      |
-| 网络   | 完全隔离    |
-| 文件系统 | 只读根 + 项目目录可写 |
-| 超时   | 300s       |
-"""
+"""opencode Docker executor: project-only mount, no host CLI fallback."""
 
 import asyncio
+import json
 import logging
 import os
+import re
 import shutil
-from dataclasses import dataclass
+import tempfile
+import uuid
+from dataclasses import dataclass, field
+from pathlib import Path
 from typing import List, Optional
 
+from config.settings import settings
 from observability.metrics import sandbox_mode as sandbox_metric
 
 logger = logging.getLogger(__name__)
-
-# 沙箱配置
 DOCKER_IMAGE = "muzhu-sandbox:latest"
-SANDBOX_TIMEOUT = 300  # 5 分钟
-MEMORY_LIMIT = "512m"
-CPU_LIMIT = "1.0"
-
-# 降级模式允许的工具（只读 — P1 #13 修复）
-# P1 #13: 原 "Bash(read-only)" 不是合法 Claude Code 工具名，会被忽略。
-# 实际做法：降级模式只给只读工具，完全不暴露 Bash
+SANDBOX_TIMEOUT = 300
+# Historical readonly tool set, kept for callers; host fallback is disabled.
 READONLY_TOOLS = ["Read", "Glob", "Grep"]
-# 完整工具集
 FULL_TOOLS = ["Read", "Write", "Edit", "Bash", "Glob", "Grep"]
+# 容器只接收这些模型配置，不转发平台其他凭证。
+MODEL_ENV_KEYS = ("OPENCODE_API_KEY",)
 
 
 @dataclass
 class SandboxResult:
-    """沙箱执行结果"""
     success: bool
     output: str = ""
     error: str = ""
-    sandbox_mode: str = "docker"  # docker | fallback_readonly | native
+    sandbox_mode: str = "docker"
+    raw: str = ""  # opencode --format json 原始 NDJSON，供 token 统计解析
+    tokens: dict = field(default_factory=dict)
+
+
+def _parse_opencode_events(raw: str) -> tuple[str, dict, str]:
+    """把 opencode --format json 的 NDJSON 事件流解析成（文本, token 用量, 错误）。"""
+    text_parts: list[str] = []
+    tokens = {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "total_cost_usd": 0.0,
+    }
+    error = ""
+    for line in (raw or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        etype = event.get("type")
+        part = event.get("part") if isinstance(event.get("part"), dict) else {}
+        if etype == "text":
+            value = part.get("text")
+            if value:
+                text_parts.append(str(value))
+        elif etype == "step_finish":
+            usage = part.get("tokens") if isinstance(part.get("tokens"), dict) else {}
+            tokens["input_tokens"] += int(usage.get("input") or 0)
+            tokens["output_tokens"] += int(usage.get("output") or 0)
+            cache = usage.get("cache") if isinstance(usage.get("cache"), dict) else {}
+            tokens["cache_read_input_tokens"] += int(cache.get("read") or 0)
+            tokens["cache_creation_input_tokens"] += int(cache.get("write") or 0)
+            cost = part.get("cost")
+            if isinstance(cost, (int, float)):
+                tokens["total_cost_usd"] += float(cost)
+        elif etype == "error":
+            info = event.get("error") if isinstance(event.get("error"), dict) else {}
+            data = info.get("data") if isinstance(info.get("data"), dict) else {}
+            message = data.get("message") or info.get("name")
+            error = str(message or "opencode 返回错误")
+    return "\n".join(text_parts).strip(), tokens, error
 
 
 class SandboxedExecutor:
-    """Docker 沙箱执行器（带降级）"""
+    """All CLI execution happens inside Docker; unavailable Docker fails closed."""
 
-    def __init__(
-        self,
-        base_dir: str = "/root",
-        docker_image: str = DOCKER_IMAGE,
-        timeout: int = SANDBOX_TIMEOUT,
-    ):
-        self.base_dir = base_dir
-        self.docker_image = docker_image
+    def __init__(self, base_dir="/root", docker_image=None,
+                 timeout=SANDBOX_TIMEOUT, allowed_tools=None):
+        self.base_dir = os.path.realpath(base_dir)
+        self.docker_image = docker_image or settings.OC_SANDBOX_IMAGE
         self.timeout = timeout
-        self._docker_available: Optional[bool] = None
-        self._check_docker()
+        self.allowed_tools = list(FULL_TOOLS if allowed_tools is None else allowed_tools)
 
     def _check_docker(self) -> bool:
-        """检查 Docker 是否可用"""
-        if self._docker_available is not None:
-            return self._docker_available
-
-        docker_path = shutil.which("docker")
-        if not docker_path:
-            logger.warning("Docker 未安装，将使用降级只读模式")
-            self._docker_available = False
-            sandbox_metric.set(0)
-            return False
-
-        self._docker_available = True
-        sandbox_metric.set(1)
-        return True
-
-    # 允许的工作目录前缀（白名单）
-    _ALLOWED_PREFIXES = ["/root", "/tmp", "/workspace"]
-
-    def _validate_working_dir(self, working_dir: Optional[str] = None) -> str:
-        """验证工作目录合法性：解析符号链接、限制在白名单内"""
-        cwd = working_dir or self.base_dir
-        real_cwd = os.path.realpath(cwd)
-        if not os.path.isdir(real_cwd):
-            raise ValueError(f"[Security] 工作目录不存在: {real_cwd}")
-        if not any(real_cwd.startswith(prefix) for prefix in self._ALLOWED_PREFIXES):
-            raise ValueError(f"[Security] 工作目录不在允许范围内: {real_cwd}")
-        return real_cwd
+        available = shutil.which("docker") is not None
+        sandbox_metric.set(int(available))
+        return available
 
     @property
     def mode(self) -> str:
-        """当前沙箱模式"""
-        if self._check_docker():
-            return "docker"
-        return "fallback_readonly"
+        # CLI presence only; daemon/image health checked when launching.
+        return "docker" if self._check_docker() else "unavailable"
 
-    @property
-    def allowed_tools(self) -> List[str]:
-        """当前模式允许的工具"""
-        if self._check_docker():
-            return FULL_TOOLS
-        return READONLY_TOOLS
+    def _validate_working_dir(self, working_dir=None) -> str:
+        cwd = Path(working_dir or self.base_dir).resolve()
+        roots = [Path(self.base_dir)]
+        if not cwd.is_dir():
+            raise ValueError("工作目录不存在")
+        # Do not mount the whole /root, /tmp, or configured project parent.
+        if cwd in roots or not any(root in cwd.parents for root in roots):
+            raise ValueError("工作目录不在允许的项目子目录范围内")
+        relative = cwd.relative_to(roots[0])
+        if any(part.startswith(".") for part in relative.parts):
+            raise ValueError("不能将宿主机隐藏配置目录作为项目挂载")
+        if any(c in str(cwd) for c in (",", "\n", "\r")):
+            raise ValueError("工作目录包含 Docker mount 不支持的字符")
+        return str(cwd)
 
-    async def execute(
-        self,
-        task: str,
-        context: Optional[str] = None,
-        working_dir: Optional[str] = None,
-    ) -> SandboxResult:
-        """
-        在沙箱中执行 Claude Code 任务
+    def _local_opencode_key(self) -> str:
+        """读取宿主机 opencode 已登录的 opencode-go 凭证（仅在环境变量缺省时兜底）。"""
+        try:
+            auth = json.loads((Path.home() / ".local/share/opencode/auth.json").read_text())
+        except (OSError, ValueError):
+            return ""
+        entry = auth.get("opencode-go") if isinstance(auth, dict) else None
+        if isinstance(entry, dict):
+            key = entry.get("key")
+            if isinstance(key, str):
+                return key
+        return ""
 
-        Args:
-            task: 任务描述
-            context: 附加上下文
-            working_dir: 工作目录（挂载到容器的 /workspace）
+    def _model_env(self) -> dict:
+        # 只转发模型凭证，绝不转发数据库、飞书、SSH 等平台其他凭证。
+        result = {}
+        for key in MODEL_ENV_KEYS:
+            value = os.environ.get(key) or getattr(settings, key, "")
+            if not value and key == "OPENCODE_API_KEY":
+                value = self._local_opencode_key()
+            if isinstance(value, str) and value:
+                if any(c in value for c in ("\n", "\r", "\x00")):
+                    raise ValueError("模型环境配置包含非法换行或空字符")
+                result[key] = value
+        if not result.get("OPENCODE_API_KEY"):
+            raise ValueError("Docker CLI 缺少模型认证：请配置 OPENCODE_API_KEY")
+        return result
 
-        Returns:
-            SandboxResult
-        """
-        if self._check_docker():
-            return await self._execute_docker(task, context, working_dir)
-        else:
-            return await self._execute_fallback(task, context, working_dir)
+    async def execute(self, task, context=None, working_dir=None, volume=None) -> SandboxResult:
+        if not self._check_docker():
+            return SandboxResult(False, error="Docker 不可用，拒绝在宿主机执行 opencode")
+        return await self._execute_docker(task, context, working_dir, volume)
 
-    async def _execute_docker(
-        self,
-        task: str,
-        context: Optional[str] = None,
-        working_dir: Optional[str] = None,
-    ) -> SandboxResult:
-        """Docker 容器内执行"""
-        cwd = self._validate_working_dir(working_dir)
+    async def _remove_container(self, name):
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "docker", "rm", "--force", name,
+                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+            )
+            try:
+                await asyncio.wait_for(proc.wait(), 10)
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.wait()
+                logger.warning("Docker 容器清理超时: %s", name)
+        except OSError:
+            logger.warning("无法清理 Docker 容器: %s", name)
 
-        # 构建完整 prompt
-        full_prompt = task
-        if context:
-            full_prompt = f"{context}\n\n---\n{task}"
+    async def _execute_docker(self, task, context=None, working_dir=None, volume=None) -> SandboxResult:
+        process = None
+        name = "muzhu-oc-" + uuid.uuid4().hex
+        try:
+            if volume:
+                if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]{0,62}", volume):
+                    raise ValueError("容器名称不可用")
+                cwd = "/workspace"
+                mount = f"type=volume,source={volume},target=/workspace"
+            else:
+                cwd = self._validate_working_dir(working_dir)
+                mount = f"type=bind,source={cwd},target=/workspace"
+            model_env = self._model_env()
+            prompt = f"{context}\n\n---\n{task}" if context else task
+            # Prompts can contain host project paths; CLI only sees /workspace.
+            prompt = prompt.replace(cwd, "/workspace")
+            prompt = "项目根目录为 /workspace；所有项目文件修改应在此目录中完成。\n" + prompt
+            # Private temporary env file avoids secrets in docker command arguments.
+            with tempfile.TemporaryDirectory(prefix="muzhu-oc-env-") as env_dir:
+                env_file = Path(env_dir) / "model.env"
+                with open(env_file, "w", opener=lambda path, flags: os.open(path, flags, 0o600)) as f:
+                    f.write("".join(f"{key}={value}\n" for key, value in model_env.items()))
+                cmd = [
+                    "docker", "run", "--rm", "--init", "--pull=never", "--name", name,
+                    "--memory", settings.OC_SANDBOX_MEMORY,
+                    "--cpus", str(settings.OC_SANDBOX_CPUS), "--pids-limit", "256",
+                    # bridge permits API calls and dependency downloads; no host network.
+                    "--network", "bridge", "--read-only", "--cap-drop", "ALL",
+                    "--security-opt", "no-new-privileges",
+                    "--tmpfs", "/tmp:rw,noexec,nosuid,size=512m,mode=1777",
+                    "--user", f"{os.getuid()}:{os.getgid()}",
+                    "--env-file", str(env_file),
+                    "--env", "HOME=/tmp/opencode-home",
+                    "--env", "OPENCODE_DISABLE_AUTOUPDATE=1",
+                    "--mount", mount,
+                    "--workdir", "/workspace", self.docker_image,
+                    "opencode", "run", prompt,
+                    "--model", settings.OPENCODE_MODEL,
+                    "--agent", settings.OPENCODE_AGENT,
+                    "--format", "json",
+                    "--auto",
+                    "--dir", "/workspace",
+                ]
+                process = await asyncio.create_subprocess_exec(
+                    *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                )
+                try:
+                    stdout, stderr = await asyncio.wait_for(process.communicate(), self.timeout)
+                except (asyncio.TimeoutError, asyncio.CancelledError) as exc:
+                    # Killing docker client alone does not stop the container.
+                    await asyncio.shield(self._remove_container(name))
+                    if process.returncode is None:
+                        process.kill()
+                        await process.wait()
+                    if isinstance(exc, asyncio.CancelledError):
+                        raise
+                    return SandboxResult(False, error=f"Docker CLI 超时（{self.timeout}秒），已尝试清理容器")
+            raw = stdout.decode("utf-8", errors="replace").strip()
+            stderr_text = stderr.decode("utf-8", errors="replace").strip()
+            text, tokens, event_error = _parse_opencode_events(raw)
+            success = process.returncode == 0 and not event_error
+            error = event_error or ("" if success else (stderr_text or "Docker CLI 执行失败"))
+            return SandboxResult(
+                success, output=text, error=error, raw=raw, tokens=tokens,
+            )
+        except (OSError, ValueError) as exc:
+            logger.warning("Docker CLI 启动失败: %s", type(exc).__name__)
+            return SandboxResult(False, error=str(exc))
 
-        cmd = [
-            "docker", "run", "--rm",
-            "--memory", MEMORY_LIMIT,
-            "--cpus", CPU_LIMIT,
-            "--network", "none",
-            "--read-only",
-            # P1 #12 修复：tmpfs 改 noexec，防止攻击者放编译后的二进制
-            # 同时加 --security-opt no-new-privileges 防止 setuid 提权
-            "--tmpfs", "/tmp:rw,noexec,size=256m",
-            "--security-opt", "no-new-privileges",
-            "-v", f"{cwd}:/workspace:rw",
-            "-w", "/workspace",
-            self.docker_image,
-            "claude", "-p", full_prompt,
-        ]
-
-        # 添加允许的工具
-        for tool in FULL_TOOLS:
-            cmd.extend(["--allowed-tools", tool])
-
+    async def check_available(self) -> bool:
+        """Probe installed image/daemon/CLI without invoking the model."""
+        if not self._check_docker():
+            return False
+        name = "muzhu-oc-check-" + uuid.uuid4().hex
         try:
             process = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                cwd=cwd,
+                "docker", "run", "--rm", "--pull=never", "--name", name,
+                "--network", "none", "--read-only", "--cap-drop", "ALL",
+                "--security-opt", "no-new-privileges",
+                "--tmpfs", "/tmp:rw,noexec,nosuid,size=64m,mode=1777",
+                self.docker_image, "opencode", "--version",
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
             )
-
             try:
-                stdout, stderr = await asyncio.wait_for(
-                    process.communicate(),
-                    timeout=self.timeout,
-                )
-            except asyncio.TimeoutError:
-                process.kill()
-                await process.wait()
-                return SandboxResult(
-                    success=False,
-                    error=f"沙箱执行超时 ({self.timeout}s)",
-                    sandbox_mode="docker",
-                )
-
-            output = stdout.decode("utf-8", errors="replace") if stdout else ""
-            error = stderr.decode("utf-8", errors="replace") if stderr else ""
-
-            success = process.returncode == 0
-
-            return SandboxResult(
-                success=success,
-                output=output,
-                error=error,
-                sandbox_mode="docker",
-            )
-
-        except FileNotFoundError:
-            logger.error("Docker 命令执行失败，回退到降级模式")
-            self._docker_available = False
-            sandbox_metric.set(0)
-            return await self._execute_fallback(task, context, working_dir)
-        except Exception as e:
-            logger.error(f"沙箱执行异常: {e}")
-            return SandboxResult(
-                success=False,
-                error=str(e),
-                sandbox_mode="docker",
-            )
-
-    async def _execute_fallback(
-        self,
-        task: str,
-        context: Optional[str] = None,
-        working_dir: Optional[str] = None,
-    ) -> SandboxResult:
-        """
-        降级模式：仅允许只读操作
-
-        不使用 Docker，直接调用 claude 但限制工具为只读。
-        """
-        cwd = self._validate_working_dir(working_dir)
-        logger.warning(f"使用降级只读模式执行: working_dir={cwd}")
-
-        full_prompt = task
-        if context:
-            full_prompt = f"{context}\n\n---\n{task}"
-
-        cmd = [
-            "claude", "-p", full_prompt,
-        ]
-        for tool in READONLY_TOOLS:
-            cmd.extend(["--allowed-tools", tool])
-
-        try:
-            process = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                cwd=cwd,
-            )
-
-            try:
-                stdout, stderr = await asyncio.wait_for(
-                    process.communicate(),
-                    timeout=self.timeout,
-                )
-            except asyncio.TimeoutError:
-                process.kill()
-                await process.wait()
-                return SandboxResult(
-                    success=False,
-                    error=f"执行超时 ({self.timeout}s)",
-                    sandbox_mode="fallback_readonly",
-                )
-
-            output = stdout.decode("utf-8", errors="replace") if stdout else ""
-            error = stderr.decode("utf-8", errors="replace") if stderr else ""
-
-            return SandboxResult(
-                success=process.returncode == 0,
-                output=output,
-                error=error,
-                sandbox_mode="fallback_readonly",
-            )
-
-        except Exception as e:
-            logger.error(f"降级执行异常: {e}")
-            return SandboxResult(
-                success=False,
-                error=str(e),
-                sandbox_mode="fallback_readonly",
-            )
+                await asyncio.wait_for(process.communicate(), 15)
+                return process.returncode == 0
+            except (asyncio.TimeoutError, asyncio.CancelledError) as exc:
+                await asyncio.shield(self._remove_container(name))
+                if process.returncode is None:
+                    process.kill()
+                    await process.wait()
+                if isinstance(exc, asyncio.CancelledError):
+                    raise
+                return False
+        except OSError:
+            return False

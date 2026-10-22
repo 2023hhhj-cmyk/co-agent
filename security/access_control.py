@@ -12,13 +12,12 @@ AccessControl — Agent 权限控制系统
 ├──────────────┼──────────────────────────────────┼────────────────────────────┤
 │ ceo          │ user_requirement, task_complete,   │ feishu, llm,               │
 │              │ report, feishu_message             │ task_decomposition         │
-│ developer    │ ceo_task_assignment, create_prd,   │ claude_code, llm           │
+│ developer    │ ceo_task_assignment, create_prd,   │ opencode, llm           │
 │              │ architecture_design                │                            │
-│ frontend     │ ceo_task_assignment, frontend_task,│ claude_code, llm           │
+│ frontend     │ ceo_task_assignment, frontend_task,│ opencode, llm           │
 │              │ ui_design, create_prd              │                            │
-│ devops       │ review_code, deploy_request,       │ docker, nginx, claude_code │
+│ devops       │ review_code, deploy_request,       │ docker, nginx, opencode │
 │              │ deploy_fix                         │                            │
-│ finance      │ deploy_complete, project_complete  │ llm                        │
 │ cs           │ customer_message                   │ wecom, database, faq       │
 └──────────────┴──────────────────────────────────┴────────────────────────────┘
 """
@@ -46,7 +45,7 @@ ROLE_PERMISSIONS: Dict[str, dict] = {
             "ceo_task_assignment", "create_prd", "architecture_design",
             "bug_report",
         },
-        "allowed_tools": {"claude_code", "llm", "code_editor", "git", "testing_framework"},
+        "allowed_tools": {"opencode", "llm", "code_editor", "git", "testing_framework"},
         "allowed_actions": {
             "design_architecture", "implement_feature", "review_code",
         },
@@ -55,7 +54,7 @@ ROLE_PERMISSIONS: Dict[str, dict] = {
         "allowed_watch": {
             "ceo_task_assignment", "frontend_task", "ui_design", "create_prd",
         },
-        "allowed_tools": {"claude_code", "llm", "playwright", "design_templates"},
+        "allowed_tools": {"opencode", "llm", "playwright", "design_templates"},
         "allowed_actions": {
             "analyze_requirement", "setup_project", "implement_frontend", "review_and_polish",
         },
@@ -64,18 +63,9 @@ ROLE_PERMISSIONS: Dict[str, dict] = {
         "allowed_watch": {
             "review_code", "deploy_request", "deploy_fix", "ceo_task_assignment",
         },
-        "allowed_tools": {"docker", "nginx", "monitoring", "claude_code"},
+        "allowed_tools": {"docker", "nginx", "monitoring", "opencode"},
         "allowed_actions": {
             "deploy", "monitor", "fix", "report",
-        },
-    },
-    "finance": {
-        "allowed_watch": {
-            "deploy_complete", "project_complete",
-        },
-        "allowed_tools": {"llm", "accounting_system", "spreadsheet"},
-        "allowed_actions": {
-            "record_cost", "generate_invoice", "financial_report",
         },
     },
     "customer_service": {

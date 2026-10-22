@@ -28,5 +28,5 @@ class TestPolicyEnforcer:
 
     def test_error_always_allowed(self):
         """所有角色可以发送 error"""
-        for role in ["ceo", "developer", "devops", "finance", "customer_service"]:
+        for role in ["ceo", "developer", "frontend_expert", "devops", "customer_service"]:
             assert self.ep.validate_message_send(role, "error"), f"{role} should send error"

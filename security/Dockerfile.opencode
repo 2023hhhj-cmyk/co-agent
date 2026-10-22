@@ -1,0 +1,16 @@
+# Build with: docker build -t muzhu-sandbox:latest -f security/Dockerfile.opencode security/
+FROM debian:bookworm-slim
+ARG OPENCODE_VERSION=1.18.30
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates curl git python3 python3-venv ripgrep tar unzip \
+    && rm -rf /var/lib/apt/lists/*
+# Install the pinned opencode standalone binary, then expose it globally.
+RUN curl -fsSL https://opencode.ai/install | bash -s -- --version "${OPENCODE_VERSION}" --no-modify-path \
+    && cp /root/.opencode/bin/opencode /usr/local/bin/opencode \
+    && chmod 0755 /usr/local/bin/opencode \
+    && rm -rf /root/.opencode /root/.cache
+ENV HOME=/tmp/opencode-home \
+    OPENCODE_DISABLE_AUTOUPDATE=1
+WORKDIR /workspace
+ENTRYPOINT ["/bin/sh", "-c", "mkdir -p \"$HOME\" && exec \"$@\"", "--"]
+CMD ["opencode", "--version"]
