@@ -44,7 +44,6 @@ AGENT_TASK_MAP: dict[str, TaskType] = {
     "developer": TaskType.COMPLEX_CODE,
     "ui_designer": TaskType.DESIGN,
     "devops": TaskType.SIMPLE_CODE,
-    "finance": TaskType.GENERAL,
 }
 
 

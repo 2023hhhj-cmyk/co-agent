@@ -1,4 +1,4 @@
-"""P1 修复测试 — 覆盖 main.py / sandbox / message_bus / state_manager 改动"""
+"""P1 修复测试 — 覆盖 main.py / sandbox / state_manager 改动"""
 
 import asyncio
 import json
@@ -47,71 +47,6 @@ class TestCEOSharedStateContextVar:
 
         assert results["A"] == "user_A", "A 协程的 sender_id 不应被 B 覆盖"
         assert results["B"] == "user_B", "B 协程的 sender_id 应独立"
-
-
-# ===== P1 #9: MessageBus 持久化 =====
-
-class TestMessageBusPersistence:
-    """P1 #9: MessageBus 可选 Redis 持久化"""
-
-    @pytest.mark.asyncio
-    async def test_publish_without_state_manager(self):
-        """无 state_manager 时仍正常工作（仅内存模式）"""
-        from communication.message_bus import MessageBus
-        from models.message import Message
-
-        bus = MessageBus()  # 无 state_manager
-        bus.register_agent("agent_1", watch={"test"})
-
-        msg = Message(content="hello", cause_by="test", sent_from="other")
-        await bus.publish(msg)
-
-        messages = await bus.get_messages("agent_1")
-        assert len(messages) == 1
-        assert messages[0].content == "hello"
-
-    @pytest.mark.asyncio
-    async def test_publish_with_state_manager_persists(self):
-        """有 state_manager 时持久化到 Redis（fire-and-forget）"""
-        from communication.message_bus import MessageBus
-        from models.message import Message
-
-        # Mock state_manager
-        sm = MagicMock()
-        sm.lpush = AsyncMock()
-        sm.ltrim = AsyncMock()
-        sm.expire = AsyncMock()
-
-        bus = MessageBus(state_manager=sm)
-        bus.register_agent("agent_1", watch={"test"})
-
-        msg = Message(content="persisted", cause_by="test", sent_from="other")
-        await bus.publish(msg)
-
-        # 等异步 fire-and-forget 完成
-        await asyncio.sleep(0.1)
-
-        # 验证 Redis 写入
-        sm.lpush.assert_called()
-        sm.ltrim.assert_called()
-        sm.expire.assert_called()
-
-    @pytest.mark.asyncio
-    async def test_persisted_history_recovery(self):
-        """从 Redis 恢复历史消息"""
-        from communication.message_bus import MessageBus
-        from models.message import Message
-
-        # Mock state_manager 模拟 Redis 中已有数据
-        sm = MagicMock()
-        sm.lrange = AsyncMock(return_value=[
-            json.dumps({"id": "1", "content": "old_msg", "cause_by": "test", "sent_from": "x", "send_to": ["*"], "role": "assistant", "metadata": {}}),
-        ])
-
-        bus = MessageBus(state_manager=sm)
-        history = await bus.get_persisted_history(limit=10)
-        assert len(history) == 1
-        assert history[0]["content"] == "old_msg"
 
 
 # ===== P1 #10: message_id 唯一性 =====

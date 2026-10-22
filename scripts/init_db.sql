@@ -69,20 +69,29 @@ CREATE INDEX IF NOT EXISTS idx_edges_source ON memory_edges(source_id);
 CREATE INDEX IF NOT EXISTS idx_edges_target ON memory_edges(target_id);
 CREATE INDEX IF NOT EXISTS idx_edges_type ON memory_edges(edge_type);
 
+-- 长期知识向量。维度与百炼 text-embedding-v4 的默认输出一致。
+CREATE EXTENSION IF NOT EXISTS vector;
+
+CREATE TABLE IF NOT EXISTS agent_knowledge (
+    id VARCHAR(64) PRIMARY KEY,
+    agent_id VARCHAR(64) NOT NULL,
+    agent_role VARCHAR(64) NOT NULL,
+    memory_type VARCHAR(64) NOT NULL,
+    content TEXT NOT NULL,
+    embedding vector(1024) NOT NULL,
+    metadata JSONB NOT NULL DEFAULT '{}',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_agent_knowledge_role ON agent_knowledge(agent_role);
+CREATE INDEX IF NOT EXISTS idx_agent_knowledge_type ON agent_knowledge(memory_type);
+CREATE INDEX IF NOT EXISTS idx_agent_knowledge_embedding
+    ON agent_knowledge USING hnsw (embedding vector_cosine_ops);
+
 CREATE TABLE IF NOT EXISTS audit_logs (
     id SERIAL PRIMARY KEY,
     agent_id VARCHAR(50) NOT NULL,
     action VARCHAR(100) NOT NULL,
     details JSONB,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE TABLE IF NOT EXISTS transactions (
-    id VARCHAR(50) PRIMARY KEY,
-    project_id VARCHAR(50) REFERENCES projects(id),
-    type VARCHAR(20) NOT NULL,
-    amount DECIMAL(10, 2) NOT NULL,
-    description TEXT,
-    date DATE DEFAULT CURRENT_DATE,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );

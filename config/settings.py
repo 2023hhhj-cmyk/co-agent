@@ -2,10 +2,11 @@
 配置设置
 """
 import os
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", extra="ignore", case_sensitive=True)  # ponytail: 忽略未声明 env vars（Claude Code CLI 的 ANTHROPIC_* 不污染 Settings）
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore", case_sensitive=True)  # ponytail: 忽略未声明 env vars（opencode 的 OPENCODE_* 不污染 Settings）
     HOST: str = "0.0.0.0"
     PORT: int = 8080
     DATABASE_URL: str = ""
@@ -13,18 +14,25 @@ class Settings(BaseSettings):
 
     # 安全配置
     API_KEY: str = ""                           # API 认证密钥（空=开发模式，不校验）
-    CORS_ORIGINS: list[str] = ["http://localhost:3000"]  # 允许的跨域来源
     RATE_LIMIT: str = "60/minute"               # 全局限速
     SSL_CERT_FILE: str = ""                     # TLS 证书路径
     SSL_KEY_FILE: str = ""                      # TLS 私钥路径
-    # ChromaDB 配置
-    CHROMADB_URL: str = "http://localhost:8000"
-    CHROMA_COLLECTION_NAME: str = "agent_knowledge"
-    EMBEDDING_MODEL: str = "all-MiniLM-L6-v2"
+    DASHSCOPE_API_KEY: str = Field(default="", repr=False)
+    DASHSCOPE_BASE_URL: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    DASHSCOPE_EMBEDDING_MODEL: str = "text-embedding-v4"
+    DASHSCOPE_EMBEDDING_DIMENSIONS: int = 1024
     DEEPSEEK_API_KEY: str = ""
     DEEPSEEK_BASE_URL: str = "https://api.deepseek.com/v1"
     DEEPSEEK_MODEL: str = "deepseek-v4-pro"
-    ANTHROPIC_API_KEY: str = ""
+    # Docker 中的 opencode 仅接收这些模型配置，不转发平台其他凭证。
+    OC_SANDBOX_IMAGE: str = "muzhu-sandbox:latest"
+    OC_SANDBOX_MEMORY: str = "2g"
+    OC_SANDBOX_CPUS: float = Field(default=1.0, gt=0)
+    OPENCODE_MODEL: str = "opencode-go/deepseek-v4-pro"
+    OPENCODE_AGENT: str = "build"
+    OPENCODE_API_KEY: str = Field(default="", repr=False)  # opencode-go provider key (oc_sk_...)
+    # 旧版 Anthropic API 客户端（ClaudeClient）仍在使用，保留该字段。
+    ANTHROPIC_API_KEY: str = Field(default="", repr=False)
     FEISHU_APP_ID: str = ""
     FEISHU_APP_SECRET: str = ""
     FEISHU_VERIFICATION_TOKEN: str = ""
@@ -43,6 +51,14 @@ class Settings(BaseSettings):
     WECOM_CS_SECRET: str = ""
     WECOM_CS_TOKEN: str = ""
     WECOM_CS_AES_KEY: str = ""
+
+    # 单进程工作区共享配额（修改后重启服务）
+    WORKSPACE_MAX_CONCURRENT_TASKS: int = Field(default=5, ge=1)
+    LLM_RPM_LIMIT: int = Field(default=60, ge=1)
+    LLM_TPM_LIMIT: int = Field(default=60000, ge=1)
+    LLM_MAX_RETRIES: int = Field(default=3, ge=0, le=10)
+    LLM_RETRY_BASE_DELAY: float = Field(default=1.0, gt=0)
+    LLM_RETRY_MAX_DELAY: float = Field(default=30.0, gt=0)
 
     # 客服队列配置
     CS_QUEUE_BATCH_SIZE: int = 5       # 每批处理数

@@ -1,13 +1,13 @@
 """
 通信系统
 
-提供消息传递基础设施：
-- MessageBus: 消息总线（发布/订阅）
-- Message: 消息模型（从 models 导入）
+客服消息使用 Redis 队列，与工作流调度分开。
+工作流节点由 WorkflowExecutor 直接调用 agent.run()。
 """
 
-from communication.message_bus import MessageBus
+from communication.queue import CSMessageQueue, QueueWorker
 
 __all__ = [
-    "MessageBus",
+    "CSMessageQueue",
+    "QueueWorker",
 ]

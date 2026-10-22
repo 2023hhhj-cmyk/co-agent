@@ -25,7 +25,6 @@ ROLE_WEIGHTS = {
     "developer": 0.8,
     "devops": 0.7,
     "frontend_expert": 0.75,
-    "finance": 0.6,
     "customer_service": 0.5,
 }
 
