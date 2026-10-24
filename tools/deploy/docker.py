@@ -34,68 +34,87 @@ class PortManager:
     管理 8001-9000 范围内的端口分配。
     """
 
-    def __init__(self, start: int = 8001, end: int = 9000):
+    def __init__(self, start: int = 8001, end: int = 9000, database=None):
         self.start = start
         self.end = end
+        self.database = database
         self.allocated: dict[int, str] = {}  # port -> service_name
         self._next_port = start
 
-    def allocate(self, service_name: str) -> int:
-        """
-        分配端口
+    async def load_allocated(self):
+        """从数据库灌回仍占用的端口。"""
+        if not self.database:
+            return
+        rows = await self.database.fetch(
+            "SELECT port, service_name FROM deployments "
+            "WHERE port > 0 AND status <> 'stopped'"
+        )
+        for row in rows:
+            self.allocated[int(row["port"])] = row["service_name"]
+        if self.allocated:
+            self._next_port = max(self.allocated) + 1
+        logger.info("restored %s ports", len(self.allocated))
 
-        Args:
-            service_name: 服务名称
-
-        Returns:
-            int: 分配的端口号
-
-        Raises:
-            RuntimeError: 如果没有可用端口
-        """
-        # 先检查是否已经为该服务分配过端口
+    async def allocate(self, service_name: str) -> int:
+        """分配端口。先认领数据库里的空闲端口，再记到内存。"""
         for port, name in self.allocated.items():
             if name == service_name:
-                logger.info(f"服务 {service_name} 已分配端口 {port}")
+                logger.info("reuse port %s for %s", port, service_name)
                 return port
 
-        # 查找可用端口
         while self._next_port <= self.end:
             port = self._next_port
             self._next_port += 1
+            if port in self.allocated or not self._is_port_available(port):
+                continue
+            if self.database:
+                try:
+                    await self.database.execute(
+                        "INSERT INTO deployments "
+                        "(service_name, kind, port, status, updated_at) "
+                        "VALUES ($1, 'docker', $2, 'deploying', NOW()) "
+                        "ON CONFLICT (service_name) DO UPDATE SET "
+                        "port = EXCLUDED.port, kind = 'docker', "
+                        "status = 'deploying', updated_at = NOW() "
+                        "WHERE deployments.status = 'stopped' "
+                        "OR deployments.port = 0 "
+                        "OR deployments.port = EXCLUDED.port",
+                        service_name, port,
+                    )
+                except Exception as exc:
+                    logger.info("port %s claim failed: %s", port, exc)
+                    continue
+                row = await self.database.fetchrow(
+                    "SELECT port FROM deployments "
+                    "WHERE service_name = $1 AND port = $2 "
+                    "AND status <> 'stopped'",
+                    service_name, port,
+                )
+                if not row:
+                    continue
+            self.allocated[port] = service_name
+            logger.info("allocated port %s for %s", port, service_name)
+            return port
 
-            # 检查端口是否被系统占用
-            if self._is_port_available(port):
-                self.allocated[port] = service_name
-                logger.info(f"为服务 {service_name} 分配端口 {port}")
-                return port
+        raise RuntimeError(f"no free port in {self.start}-{self.end}")
 
-        raise RuntimeError(f"端口已用完（{self.start}-{self.end}），请清理不用的服务")
+    async def release(self, port: int):
+        """释放端口，并把数据库记录标成已停止。"""
+        service_name = self.allocated.pop(port, None)
+        if service_name and self.database:
+            await self.database.execute(
+                "UPDATE deployments SET status = 'stopped', updated_at = NOW() "
+                "WHERE service_name = $1 AND port = $2",
+                service_name, port,
+            )
+        if service_name:
+            logger.info("released port %s for %s", port, service_name)
 
-    def release(self, port: int):
-        """
-        释放端口
-
-        Args:
-            port: 要释放的端口号
-        """
-        if port in self.allocated:
-            service_name = self.allocated.pop(port)
-            logger.info(f"释放端口 {port}（服务 {service_name}）")
-
-    def release_by_service(self, service_name: str):
-        """
-        释放服务占用的端口
-
-        Args:
-            service_name: 服务名称
-        """
-        ports_to_release = [
-            port for port, name in self.allocated.items()
-            if name == service_name
-        ]
-        for port in ports_to_release:
-            self.release(port)
+    async def release_by_service(self, service_name: str):
+        """释放服务占用的端口。"""
+        ports = [port for port, name in self.allocated.items() if name == service_name]
+        for port in ports:
+            await self.release(port)
 
     def get_port(self, service_name: str) -> Optional[int]:
         """

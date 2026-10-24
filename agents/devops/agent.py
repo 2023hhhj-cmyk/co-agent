@@ -17,10 +17,16 @@ import asyncio
 import glob
 import logging
 import os
+import re
+import threading
+import uuid
 from datetime import datetime
 from typing import Any, Optional
 
+from urllib.parse import urlparse
+
 from agents.base import BaseAgent
+from config.settings import settings
 from models.agent import ActionDef, AgentRole, ReactMode
 from models.deploy import DeployRecord, ServiceStatus
 from models.message import Message
@@ -92,9 +98,15 @@ class DevOpsAgent(BaseAgent):
             timeout=300,
         )
         self.analyzer = ProjectAnalyzer(self.opencode)
+        self.database = None
         self.port_manager = PortManager(start=8001, end=9000)
         self.docker = DockerManager(self.port_manager)
-        self.nginx = NginxManager(domain="loveboos-ai.com")
+        self.public_base_url = settings.PUBLIC_BASE_URL.rstrip("/")
+        # nginx 配置是读-改-写，必须串行化，否则并发部署会丢 location 块
+        self._nginx_lock = threading.Lock()
+        # 一个任务只执行一次部署；_react 循环会反复调用 _think
+        self._task_done = False
+        self.nginx = NginxManager(domain=urlparse(self.public_base_url).hostname or "localhost")
         self.monitor = ServiceMonitor(
             docker_manager=self.docker,
             check_interval=30,
@@ -120,10 +132,80 @@ class DevOpsAgent(BaseAgent):
         self._feishu_client = feishu_client
         self._ceo_chat_id = ceo_chat_id
 
+    def bind_database(self, database) -> None:
+        """启动后注入数据库，端口分配和部署记录都走它。"""
+        self.database = database
+        self.port_manager.database = database
+
+    async def restore_deployments(self) -> None:
+        """把未停止的部署记录灌回内存。容器不在了就标失败，不自动拉起。"""
+        if not self.database:
+            return
+        rows = await self.database.fetch(
+            "SELECT * FROM deployments WHERE status <> 'stopped'"
+        )
+        for row in rows:
+            record = DeployRecord(
+                id=row["deployment_id"] or row["service_name"],
+                service_name=row["service_name"],
+                client_name=row["client_name"] or row["client_id"],
+                client_dir=row["project_dir"] or "",
+                project_type=row["kind"] or "static",
+                container_name=row["container_name"] or "",
+                port=int(row["port"] or 0),
+                url=row["url"] or "",
+                status=row["status"] or "running",
+                error_message=row["error_message"],
+            )
+            if record.container_name:
+                running = await self.docker.is_running(record.container_name)
+                if not running:
+                    record.mark_failed("container missing after restart")
+                    await self._save_deployment(record, row["client_id"] or "", row["site_root"] or "")
+            self.deployed_services[record.id] = record
+        await self.port_manager.load_allocated()
+        logger.info("restored %s deployments", len(self.deployed_services))
+
+    async def _save_deployment(self, record: DeployRecord, client_id: str = "", site_root: str = "") -> None:
+        """把一条部署记录写入数据库。"""
+        self.deployed_services[record.id] = record
+        if not self.database:
+            return
+        deployment_id = getattr(record, "deployment_id", "") or record.id
+        await self.database.execute(
+            "INSERT INTO deployments ("
+            "deployment_id, service_name, client_id, client_name, kind, port, container_name, "
+            "site_root, project_dir, url, status, error_message, updated_at) "
+            "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NOW()) "
+            "ON CONFLICT (deployment_id) DO UPDATE SET "
+            "client_id = EXCLUDED.client_id, client_name = EXCLUDED.client_name, "
+            "kind = EXCLUDED.kind, port = EXCLUDED.port, "
+            "container_name = EXCLUDED.container_name, site_root = EXCLUDED.site_root, "
+            "project_dir = EXCLUDED.project_dir, url = EXCLUDED.url, "
+            "status = EXCLUDED.status, error_message = EXCLUDED.error_message, "
+            "updated_at = NOW()",
+            deployment_id,
+            record.service_name,
+            client_id or record.client_name,
+            record.client_name,
+            record.project_type or "static",
+            int(record.port or 0),
+            record.container_name or "",
+            site_root,
+            record.client_dir or "",
+            record.url or "",
+            record.status.value,
+            record.error_message,
+        )
+
     async def _think(self, messages: list[Message]) -> Optional[ActionDef]:
         """思考阶段"""
         logger.info(f"DEBUG devops._think called with {len(messages)} messages")
         if not messages:
+            return None
+
+        if getattr(self, "_task_done", False):
+            # 已经部署过（成功或失败），结束本任务的 Think-Act 循环
             return None
 
         last_message = messages[-1]
@@ -141,7 +223,9 @@ class DevOpsAgent(BaseAgent):
         last_message = messages[-1] if messages else None
 
         if action.name == "deploy":
-            return await self._deploy(last_message)
+            result = await self._deploy(last_message)
+            self._task_done = True
+            return result
         elif action.name == "monitor":
             return await self._monitor(last_message)
         elif action.name == "fix":
@@ -177,59 +261,41 @@ class DevOpsAgent(BaseAgent):
                 sent_from=self.agent_id,
             )
 
-        # 解析项目信息
-        project_dir = self._extract_project_dir(last_message)
-        client_name = self._extract_client_name(last_message)
+        # 解析项目信息：优先用 CEO 给的卷宿主路径（DevOps 在宿主机上，读不到 /workspace）
+        client_id = str((last_message.metadata or {}).get("client_id") or "").strip()
+        host_dir = str((last_message.metadata or {}).get("host_dir") or "").strip()
+        if not client_id or not host_dir:
+            return Message(content="部署被拒绝：缺少 client_id 或 host_dir", cause_by="error", sent_from=self.agent_id)
+        if not self._valid_host_dir(host_dir, client_id):
+            return Message(content="部署被拒绝：源目录不在允许范围内", cause_by="error", sent_from=self.agent_id)
+        project_dir = os.path.realpath(host_dir)
+        client_name = (last_message.metadata or {}).get("client_name") or client_id
+        self._deploy_client_id = client_id
+        service_name = self._generate_service_name(client_name)
 
-        if not project_dir:
-            # ponytail: plan 触发场景下 last_message 没 client_dir，主动扫描 /root/client_*/
-            logger.info("_extract_project_dir 返 None，尝试扫描 /root/client_*/")
-            try:
-                candidates = [
-                    (d, os.path.join(d, "index.html"))
-                    for d in glob.glob("/root/client_*")
-                    if os.path.isdir(d) and os.path.exists(os.path.join(d, "index.html"))
-                ]
-                if candidates:
-                    candidates.sort(key=lambda x: os.path.getmtime(x[1]), reverse=True)
-                    project_dir = candidates[0][0]
-                    client_name = os.path.basename(project_dir)
-                    service_name = self._generate_service_name(client_name)
-                    logger.info(f"自动发现 client_dir: {project_dir}")
-            except Exception as e:
-                logger.warning(f"扫描失败: {e}")
-            if not project_dir:
+        # ponytail: 先看上游声明的产物，再决定用静态托管还是容器化。
+        # 有声明就不扫目录；没有声明才回退到旧的 index.html 探测。
+        declared = self._declared_upstream_files(last_message)
+        verdict = self._looks_static(declared)
+
+        if verdict is True:
+            missing = [name for name in declared if not self._file_present(project_dir, name)]
+            if missing:
                 return Message(
-                    content="无法解析项目目录",
+                    content=f"静态部署被拒绝：上游声明了这些文件，但磁盘上不存在 → {missing[:10]}",
                     cause_by="error",
                     sent_from=self.agent_id,
                 )
-
-        # ponytail: 快速静态部署路径——跳过 Docker，client_dir 里有 index.html 就直接 nginx 托管
-        index_html = os.path.join(project_dir, "index.html")
-        if not os.path.exists(index_html):
-            # ponytail: 找不到 index.html 时扫描 /root/client_*/ 取最新的（plan 触发场景）
-            try:
-                candidates = [
-                    (d, os.path.join(d, "index.html"))
-                    for d in glob.glob("/root/client_*")
-                    if os.path.isdir(d) and os.path.exists(os.path.join(d, "index.html"))
-                ]
-                if candidates:
-                    candidates.sort(key=lambda x: os.path.getmtime(x[1]), reverse=True)
-                    project_dir = candidates[0][0]
-                    client_name = os.path.basename(project_dir)
-                    service_name = self._generate_service_name(client_name)
-                    index_html = os.path.join(project_dir, "index.html")
-                    logger.info(f"自动发现 client_dir: {project_dir}")
-            except Exception as e:
-                logger.warning(f"扫描 /root/client_*/ 失败: {e}")
-
-        if os.path.exists(index_html):
+            logger.info(f"上游声明为纯静态项目（{len(declared)} 个文件），跳过容器化: {declared[:8]}")
             return await self._static_deploy(project_dir, client_name, service_name)
 
-        # 生成服务名称
-        service_name = self._generate_service_name(client_name)
+        if verdict is False:
+            logger.info("上游声明包含后端/构建文件，走容器化部署，跳过静态判断")
+
+        if verdict is None:
+            index_html = os.path.join(project_dir, "index.html")
+            if os.path.exists(index_html):
+                return await self._static_deploy(project_dir, client_name, service_name)
 
         logger.info(f"开始部署: {service_name}，项目目录: {project_dir}")
 
@@ -277,7 +343,7 @@ class DevOpsAgent(BaseAgent):
                 raise Exception("镜像构建失败")
 
             # 第 5 步：分配端口并启动容器
-            port = self.port_manager.allocate(service_name)
+            port = await self.port_manager.allocate(service_name)
             container_name = f"loveboos-{service_name}"
             logger.info(f"[4/7] 启动容器: {container_name}，端口: {port}")
 
@@ -315,11 +381,11 @@ class DevOpsAgent(BaseAgent):
             # 第 8 步：启动监控
             logger.info("[7/7] 启动持续监控")
             record.mark_running()
-            self.deployed_services[service_name] = record
+            await self._save_deployment(record, self._deploy_client_id)
             await self.monitor.start_monitoring(record)
 
             # 生成访问 URL
-            url = f"http://loveboos-ai.com/{service_name}"
+            url = f"{self.public_base_url}/{service_name}"
             record.url = url
 
             logger.info(f"部署成功: {service_name} -> {url}")
@@ -337,13 +403,16 @@ class DevOpsAgent(BaseAgent):
                     "port": port,
                     "project_type": project_info.project_type,
                     "status": "success",
+                    "files": [],
+                    "acceptance_text": "部署完成",
+                    "passed": True,
                 },
             )
 
         except Exception as e:
             logger.error(f"部署失败: {service_name} - {e}")
             record.mark_failed(str(e))
-            self.deployed_services[service_name] = record
+            await self._save_deployment(record, self._deploy_client_id)
 
             return Message(
                 content=f"部署失败: {str(e)}",
@@ -376,8 +445,8 @@ class DevOpsAgent(BaseAgent):
     ) -> Message:
         """ponytail: Node/Vue/React 项目：npm install + build + 部署 dist/。"""
         import subprocess
-        safe_name = self._sanitize_name(service_name)
-        site_root = f"/var/www/muzhu-ai/{safe_name}"
+        client_id = getattr(self, "_deploy_client_id", "") or client_name
+        deployment_id, safe_name, public_path, site_root = self._deployment_target(client_id, service_name)
 
         async def _run(cmd, timeout=300):
             proc = await asyncio.create_subprocess_exec(
@@ -415,12 +484,18 @@ class DevOpsAgent(BaseAgent):
         shutil.copytree(dist_dir, site_root)
 
         # 写 nginx + reload
-        self._add_nginx_location(safe_name, site_root)
+        self._add_nginx_location(public_path, site_root)
         status = self._reload_nginx()
+        record = DeployRecord(
+            id=deployment_id, service_name=safe_name, client_name=client_name, client_dir=project_dir,
+            project_type="node", url=f"{self.public_base_url}/{public_path}/",
+        )
+        record.mark_running()
+        await self._save_deployment(record, self._deploy_client_id, site_root)
         return Message(
-            content=f"[Node 项目部署完成] {status}\n源: {project_dir}\n产物: {dist_dir}\n目标: {site_root}\nURL: https://47.82.5.164/{safe_name}/",
+            content=f"[Node 项目部署完成] {status}\n源: {project_dir}\n产物: {dist_dir}\n目标: {site_root}\nURL: {self.public_base_url}/{public_path}/",
             cause_by="deploy_complete", sent_from=self.agent_id,
-            metadata={"action": "deploy_node", "service_name": service_name, "site_url": f"https://47.82.5.164/{safe_name}/", "site_root": site_root},
+            metadata={"action": "deploy_node", "service_name": service_name, "site_url": f"{self.public_base_url}/{public_path}/", "site_root": site_root},
         )
 
     async def _deploy_python_project(
@@ -434,7 +509,15 @@ class DevOpsAgent(BaseAgent):
 
     def _add_nginx_location(self, safe_name: str, site_root: str) -> None:
         """ponytail: 写 location 块到现有 loveboos-ai.conf 的 marker 后。"""
-        nginx_conf = "/etc/nginx/conf.d/loveboos-ai.conf"
+        lock = getattr(self, "_nginx_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._nginx_lock = lock
+        with lock:
+            self._add_nginx_location_locked(safe_name, site_root)
+
+    def _add_nginx_location_locked(self, safe_name: str, site_root: str) -> None:
+        nginx_conf = getattr(self, "nginx_conf_path", "/etc/nginx/conf.d/loveboos-ai.conf")
         # 删旧的同 safe_name 块
         with open(nginx_conf) as f:
             content = f.read()
@@ -480,8 +563,8 @@ class DevOpsAgent(BaseAgent):
         import subprocess
 
         # 目标路径：/var/www/muzhu-ai/{service_name}
-        safe_name = self._sanitize_name(service_name)
-        site_root = f"/var/www/muzhu-ai/{safe_name}"
+        client_id = getattr(self, "_deploy_client_id", "") or client_name
+        deployment_id, safe_name, public_path, site_root = self._deployment_target(client_id, service_name)
         os.makedirs(site_root, exist_ok=True)
 
         # 复制 index.html + 任何附属文件
@@ -491,18 +574,9 @@ class DevOpsAgent(BaseAgent):
             if os.path.isfile(src):
                 shutil.copy2(src, dst)
 
-        # 写 nginx location 块——追加到 loveboos-ai.conf 的 server 块（conf.d 不支持裸 location）
-        nginx_conf = "/etc/nginx/conf.d/loveboos-ai.conf"
-        location_block = (
-            f"    # auto-deploy: {safe_name}\n"
-            f"    location /{safe_name} {{\n"
-            f"        alias {site_root};\n"
-            f"        index index.html;\n"
-            f"        try_files $uri $uri/ =404;\n"
-            f"    }}\n"
-        )
-        with open(nginx_conf, "a") as f:
-            f.write(location_block)
+        # 写 nginx location 块——必须是 server 块内的合法指令
+        # （直接 append 到 conf.d 文件末尾会落在 server 块之外，nginx -t 报错）
+        self._add_nginx_location(public_path, site_root)
 
         # reload nginx
         try:
@@ -512,10 +586,16 @@ class DevOpsAgent(BaseAgent):
             subprocess.run(
                 ["systemctl", "reload", "nginx"], check=True, capture_output=True, timeout=10
             )
-            status_msg = f"已部署到 https://muzhu-ai.com/{safe_name}/"
+            status_msg = f"已部署到 {self.public_base_url}/{public_path}/"
         except subprocess.CalledProcessError as e:
             status_msg = f"nginx reload 失败: {e.stderr.decode() if e.stderr else e}"
 
+        record = DeployRecord(
+            id=deployment_id, service_name=safe_name, client_name=client_name, client_dir=project_dir,
+            project_type="static", url=f"{self.public_base_url}/{public_path}/",
+        )
+        record.mark_running()
+        await self._save_deployment(record, self._deploy_client_id, site_root)
         return Message(
             content=f"[静态部署完成] {status_msg}\n源: {project_dir}\n目标: {site_root}",
             cause_by="deploy_complete",
@@ -523,10 +603,20 @@ class DevOpsAgent(BaseAgent):
             metadata={
                 "action": "static_deploy",
                 "service_name": service_name,
-                "site_url": f"https://muzhu-ai.com/{safe_name}/",
+                "site_url": f"{self.public_base_url}/{public_path}/",
                 "site_root": site_root,
             },
         )
+
+
+    def _deployment_target(self, client_id: str, service_name: str) -> tuple[str, str, str, str]:
+        """每次部署一个新编号，目录和网址都带上客户编号。"""
+        deployment_id = "d" + uuid.uuid4().hex[:12]
+        safe_client = self._sanitize_name(client_id or "unknown")
+        safe_name = self._sanitize_name(service_name)
+        public_path = f"c/{safe_client}/{deployment_id}"
+        site_root = f"/var/www/muzhu-ai/{public_path}"
+        return deployment_id, safe_name, public_path, site_root
 
     def _sanitize_name(self, name: str) -> str:
         """清理名称做 URL 段。"""
@@ -571,15 +661,15 @@ class DevOpsAgent(BaseAgent):
                 sent_from=self.agent_id,
             )
 
-        service_name = last_message.metadata.get("service_name")
-        if not service_name or service_name not in self.deployed_services:
+        deployment_id = last_message.metadata.get("deployment_id")
+        service = self.get_deployment(deployment_id)
+        if not service:
             return Message(
-                content=f"未找到服务: {service_name}",
+                content=f"未找到部署: {deployment_id}",
                 cause_by="error",
                 sent_from=self.agent_id,
             )
-
-        service = self.deployed_services[service_name]
+        service_name = service.service_name
         logger.info(f"尝试修复服务: {service_name}")
 
         # 尝试重启
@@ -687,6 +777,63 @@ class DevOpsAgent(BaseAgent):
             )
 
         return real_path
+
+    def _valid_host_dir(self, path: str, client_id: str = "") -> bool:
+        """只允许本客户的数据目录，拒绝链接跳到目录外。"""
+        try:
+            real = os.path.realpath(path)
+        except Exception:
+            return False
+        if not os.path.isdir(real):
+            return False
+        volume_root = "/var/lib/docker/volumes/"
+        source_root = "/var/www/muzhu-ai/sources/"
+        if real.startswith(volume_root) and real.endswith("/_data"):
+            return True
+        expected = os.path.realpath(os.path.join(source_root, self._sanitize_name(client_id)))
+        return bool(client_id) and (real == expected or real.startswith(expected + os.sep))
+
+    def _declared_upstream_files(self, message: Message) -> list[str]:
+        """读取上游声明的产物清单（兼容 dict 与纯字符串两种形式）。"""
+        raw = (message.metadata or {}).get("upstream_files") or []
+        names: list[str] = []
+        for item in raw:
+            path = item.get("path") if isinstance(item, dict) else item
+            path = str(path or "").strip().replace("\\", "/").lstrip("/")
+            if path:
+                names.append(path)
+        return names
+
+    def _looks_static(self, names: list[str]) -> Optional[bool]:
+        """按上游文件判断：True=纯静态，False=含后端/构建产物，None=无法判断。"""
+        if not names:
+            return None
+        base = {os.path.basename(name).lower() for name in names}
+        build_markers = {
+            "package.json", "requirements.txt", "pyproject.toml", "dockerfile",
+            "docker-compose.yml", "go.mod", "pom.xml", "cargo.toml", "makefile",
+            "manage.py", "app.py",
+        }
+        if base & build_markers:
+            return False
+        static_ext = {
+            ".html", ".htm", ".css", ".js", ".mjs", ".svg", ".png", ".jpg",
+            ".jpeg", ".gif", ".webp", ".ico", ".woff", ".woff2", ".ttf",
+            ".json", ".txt", ".md", ".map",
+        }
+        exts = {os.path.splitext(name)[1].lower() for name in base}
+        if exts and exts <= static_ext:
+            return True
+        return None
+
+    def _file_present(self, project_dir: str, name: str) -> bool:
+        """上游声明的文件是否真的落在项目目录里（支持子目录）。"""
+        base = os.path.basename(name)
+        for candidate in (os.path.join(project_dir, name), os.path.join(project_dir, base)):
+            if os.path.isfile(candidate):
+                return True
+        hits = glob.glob(os.path.join(project_dir, "**", base), recursive=True)
+        return bool(hits)
 
     def _extract_project_dir(self, message: Message) -> Optional[str]:
         """从消息中提取项目目录
@@ -889,6 +1036,11 @@ class DevOpsAgent(BaseAgent):
 
     # ========== Web 接口预留 ==========
 
+
+    def get_deployment(self, deployment_id: str) -> Optional[DeployRecord]:
+        """只按 deployment_id 找记录，不接受服务名。"""
+        return self.deployed_services.get(deployment_id)
+
     def get_all_services(self) -> list[dict]:
         """
         获取所有已部署服务的状态（Web 接口用）
@@ -897,9 +1049,11 @@ class DevOpsAgent(BaseAgent):
             list[dict]: 服务状态列表
         """
         services = []
-        for service_name, record in self.deployed_services.items():
+        for deployment_id, record in self.deployed_services.items():
             services.append({
-                "service_name": service_name,
+                "deployment_id": deployment_id,
+                "client_id": record.client_name,
+                "service_name": record.service_name,
                 "client_name": record.client_name,
                 "project_type": record.project_type,
                 "tech_stack": record.tech_stack,
@@ -915,7 +1069,7 @@ class DevOpsAgent(BaseAgent):
             })
         return services
 
-    def get_service_detail(self, service_name: str) -> Optional[dict]:
+    def get_service_detail(self, deployment_id: str) -> Optional[dict]:
         """
         获取单个服务的详细信息（Web 接口用）
 
@@ -925,12 +1079,13 @@ class DevOpsAgent(BaseAgent):
         Returns:
             Optional[dict]: 服务详细信息
         """
-        record = self.deployed_services.get(service_name)
+        record = self.get_deployment(deployment_id)
         if not record:
             return None
 
         return {
-            "service_name": service_name,
+            "deployment_id": deployment_id,
+            "service_name": record.service_name,
             "client_name": record.client_name,
             "client_dir": record.client_dir,
             "project_type": record.project_type,

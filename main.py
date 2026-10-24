@@ -262,6 +262,10 @@ async def lifespan(app: FastAPI):
     try:
         create_agents()
         logger.info(f"Agents created: {list(agents.keys())}")
+        devops = agents.get("devops")
+        if devops:
+            devops.bind_database(database)
+            await devops.restore_deployments()
     except Exception as e:
         logger.error(f"[Critical] Agent 创建失败: {e}", exc_info=True)
         # 不 raise，让 app 至少能响应 /health 端点
@@ -505,6 +509,31 @@ async def metrics():
     )
 
 
+async def get_or_create_client(source: str, external_id: str, display_name: str = "") -> str:
+    """第一次见到这个外部账号就分配 client_id，之后一直返回同一个。"""
+    external_id = (external_id or "").strip()
+    if not external_id:
+        raise ValueError("missing external id")
+    row = await database.fetchrow(
+        "SELECT client_id FROM clients WHERE source = $1 AND external_id = $2",
+        source, external_id,
+    )
+    if row:
+        return row["client_id"]
+    client_id = "c" + uuid.uuid4().hex[:12]
+    await database.execute(
+        "INSERT INTO clients (client_id, source, external_id, display_name) "
+        "VALUES ($1, $2, $3, $4) "
+        "ON CONFLICT (source, external_id) DO NOTHING",
+        client_id, source, external_id, display_name or "",
+    )
+    row = await database.fetchrow(
+        "SELECT client_id FROM clients WHERE source = $1 AND external_id = $2",
+        source, external_id,
+    )
+    return row["client_id"]
+
+
 @app.post("/api/requirement")
 async def create_requirement(requirement: dict):
     """
@@ -515,6 +544,11 @@ async def create_requirement(requirement: dict):
     content = requirement.get("content", "")
     if not content:
         return {"error": "Content is required"}
+    external_id = str(requirement.get("external_id") or "").strip()
+    source = str(requirement.get("source") or "api").strip() or "api"
+    if not external_id:
+        return {"error": "external_id is required"}
+    client_id = await get_or_create_client(source, external_id, str(requirement.get("display_name") or ""))
 
     ceo = agents.get("ceo")
     if not ceo:
@@ -524,12 +558,12 @@ async def create_requirement(requirement: dict):
 
     try:
         # CEO 拆解任务
-        plan = await ceo._decompose_tasks(content, "api", "")
+        plan = await ceo._decompose_tasks(content, client_id, "")
         if not plan:
             return {"status": "error", "message": "任务拆解失败"}
 
         # 执行（通过 WorkflowExecutor）
-        await ceo._execute_plan("api", plan)
+        await ceo._execute_plan(client_id, plan)
 
         return {
             "status": "success",
@@ -576,31 +610,30 @@ async def get_devops_services():
     }
 
 
-@app.get("/api/devops/services/{service_name}")
-async def get_devops_service_detail(service_name: str):
+@app.get("/api/devops/deployments/{deployment_id}")
+async def get_devops_service_detail(deployment_id: str):
     """获取单个服务的详细信息"""
     devops = agents.get("devops")
     if not devops:
         return {"error": "DevOps agent not available"}
 
-    detail = devops.get_service_detail(service_name)
+    detail = devops.get_service_detail(deployment_id)
     if not detail:
-        return {"error": f"Service not found: {service_name}"}
+        return {"error": f"Deployment not found: {deployment_id}"}
 
     return detail
 
 
-@app.post("/api/devops/services/{service_name}/restart")
-async def restart_devops_service(service_name: str):
-    """重启服务"""
+@app.post("/api/devops/deployments/{deployment_id}/restart")
+async def restart_devops_service(deployment_id: str):
+    """重启一个部署。只接受 deployment_id。"""
     devops = agents.get("devops")
     if not devops:
         return {"error": "DevOps agent not available"}
 
-    if service_name not in devops.deployed_services:
-        return {"error": f"Service not found: {service_name}"}
-
-    service = devops.deployed_services[service_name]
+    service = devops.get_deployment(deployment_id)
+    if not service:
+        return {"error": f"Deployment not found: {deployment_id}"}
     success = await devops.docker.restart(service.container_name)
 
     if success:
@@ -609,20 +642,19 @@ async def restart_devops_service(service_name: str):
         return {"status": "error", "message": f"Failed to restart service {service_name}"}
 
 
-@app.post("/api/devops/services/{service_name}/stop")
-async def stop_devops_service(service_name: str):
-    """停止服务"""
+@app.post("/api/devops/deployments/{deployment_id}/stop")
+async def stop_devops_service(deployment_id: str):
+    """停止一个部署。只接受 deployment_id。"""
     devops = agents.get("devops")
     if not devops:
         return {"error": "DevOps agent not available"}
 
-    if service_name not in devops.deployed_services:
-        return {"error": f"Service not found: {service_name}"}
-
-    service = devops.deployed_services[service_name]
+    service = devops.get_deployment(deployment_id)
+    if not service:
+        return {"error": f"Deployment not found: {deployment_id}"}
 
     # 停止监控
-    await devops.monitor.stop_monitoring(service_name)
+    await devops.monitor.stop_monitoring(service.service_name)
 
     # 停止容器
     success = await devops.docker.stop(service.container_name)
@@ -630,9 +662,11 @@ async def stop_devops_service(service_name: str):
     if success:
         service.mark_stopped()
         # 释放端口
-        devops.port_manager.release(service.port)
+        await devops.port_manager.release(service.port)
+        service.mark_stopped()
+        await devops._save_deployment(service)
         # 删除 Nginx 配置
-        await devops.nginx.remove_service(service_name)
+        await devops.nginx.remove_service(deployment_id)
         await devops.nginx.reload()
 
         return {"status": "success", "message": f"Service {service_name} stopped"}
@@ -741,7 +775,8 @@ async def feishu_webhook(request: Request):
                 except Exception as e:
                     logger.warning(f"[P2 #25] 飞书去重检查失败: {e}")
 
-            # 异步交给 CEO 处理
+            client_id = await get_or_create_client("feishu", chat_id)
+            logger.info("feishu client_id=%s chat_id=%s", client_id, chat_id)
             ceo = agents.get("ceo")
             if ceo:
                 asyncio.create_task(
@@ -875,7 +910,8 @@ async def wecom_ceo_callback(request: Request):
             return {"code": 0}
         _ceo_processed_messages.add(msg_id)
 
-    logger.info(f"企业微信 CEO 收到消息: from={from_user}, content={content[:50]}...")
+    client_id = await get_or_create_client("wecom_ceo", from_user)
+    logger.info("wecom ceo client_id=%s from=%s", client_id, from_user)
 
     # 交给 CEO Agent 处理
     ceo = agents.get("ceo")
@@ -1034,10 +1070,11 @@ async def wecom_cs_callback(request: Request):
         except Exception as e:
             logger.warning(f"[P2 #25] CS 去重检查失败: {e}")
 
-    # 放入队列
-    cs_queue = CSMessageQueue(state_manager.redis)
+    client_id = await get_or_create_client("wecom_cs", from_user)
+    logger.info("wecom cs client_id=%s from=%s", client_id, from_user)
+    cs_queue = CSMessageQueue(state_manager.redis, client_id=client_id)
     queued_msg = QueuedMessage(
-        customer_id=from_user,
+        customer_id=client_id,
         text=content,
         wecom_msg_id=msg_id,
         metadata={"response_url": response_url} if response_url else {},

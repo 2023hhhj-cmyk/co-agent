@@ -33,8 +33,15 @@ class CSMessageQueue:
     QUEUE_KEY = "cs:message_queue"
     NOTIFY_KEY_PREFIX = "cs:notify_msg:"
 
-    def __init__(self, redis_client: redis.Redis):
+    def __init__(self, redis_client: redis.Redis, client_id: str = ""):
         self.redis = redis_client
+        self.client_id = client_id
+
+    def key_for(self, client_id: str = "") -> str:
+        cid = client_id or self.client_id
+        if not cid:
+            raise ValueError("client_id required")
+        return f"{self.QUEUE_KEY}:{cid}"
 
     async def enqueue(self, message: QueuedMessage) -> int:
         """
@@ -47,10 +54,10 @@ class CSMessageQueue:
             放入前的队列长度（前面有多少人在等待）
         """
         # 先获取当前队列长度（用于排队提示）
-        queue_len = await self.redis.llen(self.QUEUE_KEY)
+        queue_len = await self.redis.llen(self.key_for())
 
         # 放入队列
-        await self.redis.lpush(self.QUEUE_KEY, json.dumps(message.to_dict()))
+        await self.redis.lpush(self.key_for(), json.dumps(message.to_dict()))
 
         logger.info(f"消息入队: customer={message.customer_id}, queue_len={queue_len}")
         return queue_len
@@ -67,7 +74,7 @@ class CSMessageQueue:
         """
         messages = []
         for _ in range(count):
-            data = await self.redis.rpop(self.QUEUE_KEY)
+            data = await self.redis.rpop(self.key_for())
             if data is None:
                 break
             try:
@@ -80,7 +87,7 @@ class CSMessageQueue:
 
     async def get_queue_length(self) -> int:
         """获取当前队列长度"""
-        return await self.redis.llen(self.QUEUE_KEY)
+        return await self.redis.llen(self.key_for())
 
     async def save_notify_msg_id(self, customer_id: str, msg_id: str, expire: int = 600) -> None:
         """
@@ -110,6 +117,23 @@ class CSMessageQueue:
             await self.redis.delete(key)
         return msg_id
 
+
+
+    async def dequeue_all(self, count: int = 5) -> list[QueuedMessage]:
+        """按客户分键取出消息，一个客户的积压不会堵住另一个客户。"""
+        keys = await self.redis.keys(f"{self.QUEUE_KEY}:*")
+        messages = []
+        for key in keys:
+            if len(messages) >= count:
+                break
+            data = await self.redis.rpop(key)
+            if not data:
+                continue
+            try:
+                messages.append(QueuedMessage.from_dict(json.loads(data)))
+            except Exception as exc:
+                logger.error("bad queued message: %s", exc)
+        return messages
 
 class QueueWorker:
     """
@@ -162,7 +186,7 @@ class QueueWorker:
         while self._running:
             try:
                 # 取出一批消息
-                messages = await self.queue.dequeue(self.batch_size)
+                messages = await self.queue.dequeue_all(self.batch_size)
 
                 if not messages:
                     # 队列为空，等待

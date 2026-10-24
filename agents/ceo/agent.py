@@ -38,6 +38,7 @@ from tools.llm.client import LLMClient
 from tools.llm.prompt import PromptManager
 from workflows.converter import PlanToGraphConverter
 from workflows.executor import WorkflowExecutor
+from workflows.state import ProjectState, TaskOutcome, clip_text
 from workflows.graph import WorkflowGraph
 
 logger = logging.getLogger(__name__)
@@ -517,6 +518,7 @@ assigned_to 只能是 developer、frontend_expert、devops。"""
     async def _write_client_design_doc(self, plan: ProjectPlan) -> None:
         """为客户创建一个长期容器，并把需求文档写入容器里的 /workspace。"""
         label = self._client_label(plan.requirement, plan.chat_id)
+        plan.client_id = label
         api = getattr(self, "customer_containers", None) or CustomerContainers()
         self.customer_containers = api
         text = (plan.design_doc or "").strip() or f"# 需求文档\n\n{plan.requirement.strip()}\n"
@@ -642,8 +644,11 @@ assigned_to 只能是 developer、frontend_expert、devops。"""
             executor = WorkflowExecutor(graph=graph, agents=self.team)
             context = {
                 "outputs": {},
+                "client_id": plan.client_id,
                 "task_descriptions": {},
                 "task_metadata": {},
+                # 用于按图上的真实依赖计算深度（task.dependencies 可能是标题而非 id）
+                "_graph": graph,
             }
             input_message = Message(
                 content=plan.requirement,
@@ -714,34 +719,33 @@ assigned_to 只能是 developer、frontend_expert、devops。"""
                 reason = f"前置任务失败或被跳过: {', '.join(blocked)}"
                 task.mark_skipped(reason)
                 outputs[task.id] = {"error": reason, "skipped": True, "blocked_by": blocked}
+                self._record_outcome(task, context, {}, "skipped", reason)
                 skipped.append(task)
             else:
                 ready.append(task)
         return ready, skipped
 
     def _fill_assignment(self, plan: ProjectPlan, ready: list[Task], context: dict) -> None:
-        """把需求文档、验收标准和上游产物放进这一批任务的消息。"""
-        outputs = context["outputs"]
+        """把需求、祖先产出和当前任务整理成上下文块。
+
+        与旧实现的区别：不再只取直接父节点的 content[:300]，而是把已完成的
+        所有上游节点按层累积成 ProjectState，再渲染成下游可用的结构化块。
+        """
+        state = ProjectState(
+            requirement=plan.requirement,
+            design_doc_path=plan.design_doc_path or "",
+        )
+        for outcome in context.get("outcomes", {}).values():
+            state.add(outcome)
+
         for task in ready:
-            upstream = []
-            for parent_id in task.dependencies:
-                parent = self._resolve_task(plan, parent_id)
-                if parent is None:
-                    continue
-                raw = outputs.get(parent.id, {})
-                content = raw.get("content", "") if isinstance(raw, dict) else ""
-                if content:
-                    upstream.append(f"- {parent.title}: {content[:300]}")
-            lines = [task.description]
-            if task.acceptance:
-                lines.append(f"\n验收：{task.acceptance}")
-            if plan.design_doc_path:
-                lines.append(f"需求文档：{plan.design_doc_path}")
-            elif plan.design_doc:
-                lines.append(f"需求文档：\n{plan.design_doc[:2000]}")
-            if upstream:
-                lines.append("上游产物：\n" + "\n".join(upstream))
-            context["task_descriptions"][task.id] = "\n".join(lines)
+            rendered = state.render(task.description, task.acceptance)
+            context["task_descriptions"][task.id] = rendered
+            logger.info(
+                "[assignment] task=%s role=%s chars=%d upstream=%d layers=%s",
+                task.id, task.assigned_to, len(rendered),
+                len(state.outcomes), sorted({o.depth for o in state.outcomes.values()}),
+            )
             context["task_metadata"][task.id] = {
                 "plan_id": plan.id,
                 "task_id": task.id,
@@ -752,8 +756,21 @@ assigned_to 只能是 developer、frontend_expert、devops。"""
                 "client_dir": plan.client_dir,
                 "container_name": plan.container_name,
                 "volume_name": plan.volume_name,
+                # DevOps 跑在宿主机上，读不到容器里的 /workspace，必须给卷的宿主路径
+                "host_dir": (
+                    f"/var/lib/docker/volumes/{plan.volume_name}/_data"
+                    if plan.volume_name else ""
+                ),
+                "client_name": (plan.container_name or "").replace("muzhu-customer-", "") or "",
+                "client_id": plan.client_id or "",
                 "container_error": plan.container_error,
-                "upstream": upstream,
+                # 兼容旧字段：Agent 内部仍会读 meta["upstream"]
+                "upstream": [o.line() for o in state.ordered()],
+                # 结构化上游产物，供 DevOps 判断项目类型（不再扫目录）
+                "upstream_files": [
+                    {"path": path, "producer": producer}
+                    for path, producer in state.files()
+                ],
             }
 
     def _resolve_task(self, plan: ProjectPlan, ref: str) -> Optional[Task]:
@@ -775,22 +792,62 @@ assigned_to 只能是 developer、frontend_expert、devops。"""
             return False, f"未满足验收：{acceptance}"
         return True, ""
 
+    def _record_outcome(self, task: Task, context: dict, output: dict,
+                        status: str, error: str = "") -> None:
+        """把一个节点的结果沉淀成结构化 outcome，供下游按层读取。"""
+        meta = (output or {}).get("metadata") or {}
+        if not isinstance(meta, dict):
+            meta = {}
+        graph = context.get("_graph")
+        if graph is not None:
+            parent_ids = list(graph.reverse_adj.get(task.id, []))
+        else:
+            parent_ids = list(task.dependencies or [])
+        parents = [
+            context.get("outcomes", {}).get(pid)
+            for pid in parent_ids
+        ]
+        depth = 1 + max([p.depth for p in parents if p is not None], default=0)
+        outcome = TaskOutcome(
+            task_id=task.id,
+            title=task.title,
+            role=task.assigned_to,
+            depth=depth,
+            status=status,
+            summary=clip_text((output or {}).get("content") or "", 200),
+            files=list(meta.get("files") or []),
+            acceptance=(meta.get("acceptance_text") or task.acceptance or "")[:300],
+            passed=(status == "ok"),
+            artifacts={
+                key: meta[key]
+                for key in ("url", "port", "service_name", "container_name")
+                if meta.get(key)
+            },
+            error=error or str(meta.get("error") or ""),
+            result_path=str(meta.get("result_path") or ""),
+        )
+        context.setdefault("outcomes", {})[task.id] = outcome
+
     async def _settle_task(self, chat_id: str, plan: ProjectPlan, task: Task, context: dict) -> None:
         output = context["outputs"].get(task.id)
         if not isinstance(output, dict):
             task.mark_failed("无输出")
             context["outputs"][task.id] = {"error": "无输出"}
+            self._record_outcome(task, context, {}, "failed", "无输出")
             return
         if "error" in output:
             task.mark_failed(str(output["error"]))
+            self._record_outcome(task, context, output, "failed", str(output["error"]))
             return
         ok, reason = self._meets_acceptance(task, output)
         if ok:
             task.mark_completed((output.get("content") or "")[:500])
+            self._record_outcome(task, context, output, "ok")
             await self._send_feishu_text(chat_id, f"✅ 任务 [{task.title}] 已完成")
             return
         task.mark_failed(reason)
         context["outputs"][task.id] = {"error": reason, "content": output.get("content", "")}
+        self._record_outcome(task, context, output, "failed", reason)
 
     # ========== 进度查询 ==========
 

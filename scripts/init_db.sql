@@ -91,7 +91,45 @@ CREATE INDEX IF NOT EXISTS idx_agent_knowledge_embedding
 CREATE TABLE IF NOT EXISTS audit_logs (
     id SERIAL PRIMARY KEY,
     agent_id VARCHAR(50) NOT NULL,
+    agent_role VARCHAR(50) DEFAULT '',
     action VARCHAR(100) NOT NULL,
     details JSONB,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+
+
+-- 已部署服务。端口和站点在进程重启后仍要认得。
+CREATE TABLE IF NOT EXISTS deployments (
+    service_name VARCHAR(80) PRIMARY KEY,
+    client_id VARCHAR(80) NOT NULL DEFAULT '',
+    client_name VARCHAR(200) NOT NULL DEFAULT '',
+    kind VARCHAR(20) NOT NULL DEFAULT 'static',
+    port INTEGER NOT NULL DEFAULT 0,
+    container_name VARCHAR(120) NOT NULL DEFAULT '',
+    site_root TEXT NOT NULL DEFAULT '',
+    project_dir TEXT NOT NULL DEFAULT '',
+    url TEXT NOT NULL DEFAULT '',
+    status VARCHAR(20) NOT NULL DEFAULT 'running',
+    error_message TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_deployments_live_port
+    ON deployments(port)
+    WHERE port > 0 AND status <> 'stopped';
+
+-- 客户第一次发消息时建档。外部账号不变，client_id 就不变。
+CREATE TABLE IF NOT EXISTS clients (
+    client_id VARCHAR(40) PRIMARY KEY,
+    source VARCHAR(20) NOT NULL,
+    external_id VARCHAR(160) NOT NULL,
+    display_name VARCHAR(200) NOT NULL DEFAULT '',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_clients_identity
+    ON clients(source, external_id);
+
+ALTER TABLE deployments ADD COLUMN IF NOT EXISTS deployment_id VARCHAR(40);
+ALTER TABLE deployments ADD COLUMN IF NOT EXISTS public_path VARCHAR(200) NOT NULL DEFAULT '';
