@@ -46,6 +46,7 @@ class DeployRecord(BaseModel):
     id: str = Field(default_factory=lambda: uuid.uuid4().hex[:8])
     service_name: str          # 服务名称（用于 URL 路径）
     client_name: str           # 客户名称
+    client_id: str = ""       # 固定客户编号
     client_dir: str            # 项目目录
     project_type: str = "unknown"  # 项目类型 (node/python/static/mixed)
     tech_stack: list[str] = Field(default_factory=list)  # 技术栈
@@ -56,7 +57,7 @@ class DeployRecord(BaseModel):
     port: int = 0              # 分配的端口
 
     # 访问配置
-    url: str = ""              # 访问 URL（如 http://loveboos-ai.com/client-a）
+    url: str = ""              # 访问 URL（如 {PUBLIC_BASE_URL}/client-a）
     health_check_path: str = "/"  # 健康检查路径
 
     # 状态

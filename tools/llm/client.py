@@ -11,6 +11,9 @@ import json
 import logging
 import math
 import random
+import uuid
+from contextlib import contextmanager
+from contextvars import ContextVar
 from asyncio import sleep
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
@@ -23,6 +26,24 @@ from config.settings import settings
 from tools.llm.rate_limit import get_llm_rate_limiter
 
 logger = logging.getLogger(__name__)
+
+# OpenCode Go 网关要求稳定的会话标识，用于路由与提示缓存
+_OPENCODE_SESSION_ID = f"ses_coagent_{uuid.uuid4().hex[:16]}"
+
+# 每次调用的 usage 收集器：按协程隔离，避免并发请求互相覆盖
+_usage_sink: ContextVar[Optional[Dict[str, Any]]] = ContextVar("llm_usage_sink", default=None)
+
+
+@contextmanager
+def collect_usage():
+    """with collect_usage() as usage: 之后可读到本次所有 LLM 调用的累计用量。"""
+    sink: Dict[str, Any] = {}
+    token = _usage_sink.set(sink)
+    try:
+        yield sink
+    finally:
+        _usage_sink.reset(token)
+
 
 
 class LLMClient(ABC):
@@ -112,9 +133,17 @@ class LLMClient(ABC):
             actual_tokens = None
             retry_error = None
             try:
-                result = await self._chat_impl(messages, temperature, max_tokens, **kwargs)
-                # Snapshot immediately: clients are shared by concurrent requests.
-                usage = dict(self._last_usage)
+                call_usage: Dict[str, Any] = {}
+                result = await self._chat_impl(
+                    messages, temperature, max_tokens, usage_out=call_usage, **kwargs,
+                )
+                # 本次调用自己的用量：共享 client 时不会被并发请求覆盖
+                usage = dict(call_usage) or dict(self._last_usage)
+                _sink = _usage_sink.get()
+                if _sink is not None:
+                    for _key, _value in usage.items():
+                        if isinstance(_value, (int, float)):
+                            _sink[_key] = _sink.get(_key, 0) + _value
                 if "total_tokens" in usage:
                     actual_tokens = usage["total_tokens"]
                 elif "prompt_tokens" in usage and "completion_tokens" in usage:
@@ -132,7 +161,9 @@ class LLMClient(ABC):
                 await limiter.finish(reservation, actual_tokens)
 
             if retry_error is None:
-                await self._store_cache(messages, temperature, result, success=True)
+                # use_cache=False 表示既不读缓存也不写缓存
+                if use_cache:
+                    await self._store_cache(messages, temperature, result, success=True)
                 return result
 
             delay = self._retry_delay(retry_error, attempt)
@@ -179,6 +210,7 @@ class LLMClient(ABC):
         messages: List[Dict[str, str]],
         temperature: float = 0.7,
         max_tokens: int = 4096,
+        usage_out: Optional[Dict[str, Any]] = None,
         **kwargs,
     ) -> str:
         """实际 API 调用（子类实现）"""
@@ -301,6 +333,7 @@ class DeepSeekClient(LLMClient):
         messages: List[Dict[str, str]],
         temperature: float = 0.7,
         max_tokens: int = 4096,
+        usage_out: Optional[Dict[str, Any]] = None,
         **kwargs,
     ) -> str:
         client = await self._get_client()
@@ -308,6 +341,10 @@ class DeepSeekClient(LLMClient):
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
         }
+        # OpenCode Go 网关（opencode.ai/inference）要求 x-opencode-session 才能路由
+        if "opencode.ai" in (self.base_url or ""):
+            headers["x-opencode-session"] = _OPENCODE_SESSION_ID
+            headers["User-Agent"] = "co-agent/1.0 (+opencode-go)"
         payload = {
             "model": self.model,
             "messages": messages,
@@ -325,6 +362,8 @@ class DeepSeekClient(LLMClient):
             response.raise_for_status()
             data = response.json()
             self._last_usage = data.get("usage", {}) or {}
+            if usage_out is not None:
+                usage_out.update(self._last_usage)
             message = data["choices"][0]["message"]
             # 推理模型（如 deepseek-v4-pro）可能把内容放在 reasoning_content 中
             content = message.get("content", "")
@@ -355,6 +394,7 @@ class ClaudeClient(LLMClient):
         messages: List[Dict[str, str]],
         temperature: float = 0.7,
         max_tokens: int = 4096,
+        usage_out: Optional[Dict[str, Any]] = None,
         **kwargs,
     ) -> str:
         client = await self._get_client()
@@ -396,6 +436,8 @@ class ClaudeClient(LLMClient):
                 "prompt_tokens": _u.get("input_tokens", 0),
                 "completion_tokens": _u.get("output_tokens", 0),
             }
+            if usage_out is not None:
+                usage_out.update(self._last_usage)
             return data["content"][0]["text"]
         except Exception as e:
             logger.error(f"Claude API call failed: {type(e).__name__}", exc_info=True)

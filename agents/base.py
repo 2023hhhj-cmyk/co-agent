@@ -25,7 +25,7 @@ from observability.metrics import (
     task_total,
     messages_processed,
 )
-from tools.llm.client import LLMClient
+from tools.llm.client import LLMClient, collect_usage
 from tools.llm.prompt import PromptManager
 
 
@@ -79,6 +79,8 @@ class BaseAgent(ABC):
     ):
         # 基础属性
         self.agent_id = str(uuid.uuid4())
+        # 会话记忆的归属 id：fork 后仍指向原 agent，避免任务记忆碎片化
+        self.memory_owner_id = self.agent_id
         self.role = role
         self.llm = llm_client
         self.prompt_manager = PromptManager()
@@ -106,6 +108,38 @@ class BaseAgent(ABC):
         # 动作状态
         self.todo: ActionDef | None = None
         self.state_index: int = 0  # BY_ORDER 模式下的状态索引
+
+    # ========== 每任务隔离 ==========
+
+    def fork(self, client_id: str = "") -> "BaseAgent":
+        """为单个任务创建独立执行上下文：共享服务，隔离可变状态。
+
+        不调用 __init__，因此不会新建 LLM 客户端或数据库连接。
+        """
+        shared = object.__new__(type(self))
+        fresh = {
+            "agent_id", "message_queue", "memory", "_working_memory",
+            "state", "todo", "state_index",
+        }
+        shared.__dict__.update(
+            {k: v for k, v in self.__dict__.items() if k not in fresh}
+        )
+        shared.agent_id = str(uuid.uuid4())
+        # 记忆归属按「客户+角色」确定性生成：同客户同角色跨任务、跨重启稳定；
+        # 不同客户落到不同 key，天然隔离。未指定客户时沿用原归属。
+        if client_id:
+            shared.memory_owner_id = str(uuid.uuid5(
+                uuid.NAMESPACE_DNS, f"muzhu:{client_id}:{self.role.name}",
+            ))
+        else:
+            shared.memory_owner_id = self.memory_owner_id
+        shared.message_queue = MessageQueue()
+        shared.memory = []
+        shared._working_memory = None
+        shared.state = "idle"
+        shared.todo = None
+        shared.state_index = 0
+        return shared
 
     # ========== 属性 ==========
 
@@ -297,9 +331,10 @@ class BaseAgent(ABC):
             _think_start = _t.time()
             emit_event("agent.think", agent_role=self.role.name, phase="start")
             try:
-                action = await self._think(messages)
-                # ponytail: capture LLM token usage (empty on cache hit)
-                _u = self.llm.get_last_usage() if self.llm else {}
+                # 用量按协程隔离收集，避免并发时读到别的请求的 usage
+                with collect_usage() as _usage:
+                    action = await self._think(messages)
+                _u = _usage
                 emit_event("agent.think", agent_role=self.role.name, phase="end",
                            duration_ms=int((_t.time() - _think_start) * 1000), success=True,
                            prompt_tokens=_u.get("prompt_tokens", 0),
@@ -317,9 +352,9 @@ class BaseAgent(ABC):
                        action_name=action.name, action_args_hash=hash_args(action.model_dump()))
             try:
                 # ponytail: 传 messages 让 _act 拿到 last_message（含 PRD 等上下文）
-                result = await self._act(action, context={"messages": messages})
-                # ponytail: capture LLM token usage (empty on cache hit, populated for real calls)
-                _u = self.llm.get_last_usage() if self.llm else {}
+                with collect_usage() as _usage:
+                    result = await self._act(action, context={"messages": messages})
+                _u = _usage
                 emit_event("agent.act", agent_role=self.role.name, phase="end",
                            action_name=action.name,
                            duration_ms=int((_t.time() - _act_start) * 1000), success=True,
@@ -406,6 +441,7 @@ class BaseAgent(ABC):
         task_start = time.time()
         result = None
         succeeded = False
+        outcome = "success"
         try:
             # 根据反应模式执行
             if self.role.react_mode == ReactMode.REACT:
@@ -422,6 +458,9 @@ class BaseAgent(ABC):
                 await self.publish_message(result)
 
             succeeded = True
+            # 返回错误 Message 而未抛异常的任务，同样记为失败
+            if getattr(result, "cause_by", "") in ("error", "failed"):
+                outcome = "failed"
             return result
 
         except Exception as e:
@@ -433,6 +472,7 @@ class BaseAgent(ABC):
                 try:
                     await self.audit_logger.log_task_executed(
                         self.agent_id, str(e)[:200], result="error", duration_ms=0,
+                        agent_role=self.role.name,
                     )
                 except Exception:
                     logger.exception("记录任务失败审计时出错")
@@ -448,14 +488,14 @@ class BaseAgent(ABC):
             agent_state_metric.labels(agent=self.name, role=self.role.name).set(0)
             task_duration_metric.labels(agent=self.name).observe(elapsed)
             if succeeded:
-                task_total.labels(agent=self.name, status="success").inc()
+                task_total.labels(agent=self.name, status=outcome).inc()
             # 审计失败不改变任务执行结果。
             if succeeded and self.audit_logger and result:
                 try:
                     await self.audit_logger.log_task_executed(
                         self.agent_id,
                         result.content[:200] if result.content else "",
-                        result="success",
+                        result=outcome, agent_role=self.role.name,
                     )
                 except Exception:
                     logger.exception("记录任务成功审计时出错")
@@ -463,11 +503,14 @@ class BaseAgent(ABC):
             if self.memory_manager and self.working_memory and not self.working_memory.is_empty:
                 try:
                     await self.memory_manager.archive_working_memory(
-                        agent_id=self.agent_id,
+                        agent_id=self.memory_owner_id,
                         agent_role=self.role.name,
                         working_memory=self.working_memory,
                     )
                     self.working_memory.clear()
+                    if hasattr(self.memory_manager, "drop_working"):
+                        self.memory_manager.drop_working(self.agent_id)
+                    self._working_memory = None
                 except Exception as e:
                     logger.warning(f"归档工作记忆失败: {e}")
 
@@ -519,7 +562,7 @@ class BaseAgent(ABC):
             return []
         return await self.memory_manager.recall(
             query=query,
-            agent_id=self.agent_id,
+            agent_id=self.memory_owner_id,
             agent_role=self.role.name,
             strategy=strategy,
             top_k=top_k,
@@ -546,7 +589,7 @@ class BaseAgent(ABC):
             return None
         return await self.memory_manager.remember(
             content=content,
-            agent_id=self.agent_id,
+            agent_id=self.memory_owner_id,
             agent_role=self.role.name,
             memory_type=memory_type,
             metadata=metadata,
@@ -573,7 +616,7 @@ class BaseAgent(ABC):
             return ""
         return await self.memory_manager.get_context(
             query=query,
-            agent_id=self.agent_id,
+            agent_id=self.memory_owner_id,
             agent_role=self.role.name,
             strategy=strategy,
             max_tokens_estimate=max_tokens_estimate,
@@ -606,7 +649,7 @@ class BaseAgent(ABC):
             # 检索相关上下文（限定 500 token 估算）
             context = await self.memory_manager.get_context(
                 query=query,
-                agent_id=self.agent_id,
+                agent_id=self.memory_owner_id,
                 agent_role=self.role.name,
                 strategy="default",
                 max_tokens_estimate=500,

@@ -29,13 +29,13 @@ class NginxManager:
     """
     Nginx 配置管理器
 
-    管理 loveboos-ai.com 的反向代理配置。
-    使用路径方式：http://loveboos-ai.com/{service_name}
+    管理对外域名的反向代理配置。
+    使用路径方式：{PUBLIC_BASE_URL}/{service_name}
     """
 
     def __init__(
         self,
-        domain: str = "loveboos-ai.com",
+        domain: str = "www.loveboos-ai.com",
         conf_dir: str = NGINX_CONF_DIR,
     ):
         self.domain = domain

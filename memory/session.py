@@ -125,6 +125,8 @@ class SessionMemory:
 
             list_key = REDIS_TASK_LIST_KEY.format(agent_id=agent_id)
             await self.redis.lpush(list_key, task_id)
+            # 列表键必须单独设过期，否则会随 agent 数量无限累积
+            await self.redis.expire(list_key, REDIS_TASK_TTL)
             # 裁剪列表，保持上限
             await self.redis.ltrim(list_key, 0, MAX_TASK_LIST - 1)
         except Exception as e:

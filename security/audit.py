@@ -72,6 +72,7 @@ class AuditLogger:
         action: str,
         agent_id: str = "",
         details: Optional[Dict[str, Any]] = None,
+        agent_role: str = "",
     ) -> str:
         """
         记录审计事件
@@ -85,15 +86,18 @@ class AuditLogger:
 
         # 1. 始终输出日志
         detail_str = json.dumps(details, ensure_ascii=False, default=str)[:500]
-        logger.info(f"[AUDIT] {action} | agent={agent_id[:8]} | {detail_str}")
+        logger.info(
+            f"[AUDIT] {action} | agent={agent_id[:8]} role={agent_role or '-'} | {detail_str}"
+        )
 
         # 2. 写入数据库
         if self.db:
             try:
                 await self.db.execute(
-                    """INSERT INTO audit_logs (agent_id, action, details, created_at)
-                       VALUES ($1, $2, $3, $4)""",
+                    """INSERT INTO audit_logs (agent_id, agent_role, action, details, created_at)
+                       VALUES ($1, $2, $3, $4, $5)""",
                     agent_id or "system",
+                    agent_role or "",
                     action,
                     json.dumps(details, ensure_ascii=False, default=str),
                     datetime.now(),
@@ -108,6 +112,7 @@ class AuditLogger:
                     "audit_id": audit_id,
                     "action": action,
                     "agent_id": agent_id,
+                    "agent_role": agent_role,
                     "details": details,
                     "error": str(e),
                     "failed_at": datetime.now().isoformat(),
@@ -132,9 +137,10 @@ class AuditLogger:
         for event in self._failed_events:
             try:
                 await self.db.execute(
-                    """INSERT INTO audit_logs (agent_id, action, details, created_at)
-                       VALUES ($1, $2, $3, $4)""",
+                    """INSERT INTO audit_logs (agent_id, agent_role, action, details, created_at)
+                       VALUES ($1, $2, $3, $4, $5)""",
                     event.get("agent_id") or "system",
+                    event.get("agent_role") or "",
                     event["action"],
                     json.dumps(event.get("details", {}), ensure_ascii=False, default=str),
                     datetime.fromisoformat(event["failed_at"]),
@@ -177,11 +183,13 @@ class AuditLogger:
         task: str,
         result: str = "",
         duration_ms: int = 0,
+        agent_role: str = "",
     ) -> str:
         """记录任务执行事件"""
         return await self.log(
             action="task_executed",
             agent_id=agent_id,
+            agent_role=agent_role,
             details={
                 "task_preview": task[:200],
                 "result_preview": result[:200] if result else "",

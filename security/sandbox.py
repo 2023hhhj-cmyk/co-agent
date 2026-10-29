@@ -50,7 +50,8 @@ def _node_heap_mb(memory: str) -> int:
     mib = _memory_mib(memory)
     if mib <= 0:
         return 768
-    return max(256, int(mib * 0.75))
+    # 0.6 而非 0.75：给 Node 运行时、native 模块和子进程留出余量，避免 cgroup OOM
+    return max(256, min(1024, int(mib * 0.6)))
 
 
 @dataclass

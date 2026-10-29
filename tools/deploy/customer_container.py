@@ -58,21 +58,40 @@ class CustomerContainers:
     def __init__(self, runner=None, image: Optional[str] = None):
         self.runner = runner
         self.image = image or settings.OC_SANDBOX_IMAGE
+        # 同一容器的创建必须串行：inspect 与 run 之间有 await 窗口
+        self._locks: dict[str, asyncio.Lock] = {}
+
+    def _lock_for(self, name: str) -> asyncio.Lock:
+        lock = self._locks.get(name)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._locks[name] = lock
+        return lock
 
     async def ensure(self, label: str) -> CustomerWorkspace:
         name = validate_docker_name(container_name_for(label))
+        async with self._lock_for(name):
+            return await self._ensure_locked(name)
+
+    async def _ensure_locked(self, name: str) -> CustomerWorkspace:
         await self._docker(["volume", "create", name])
         code, out, _err = await self._docker(
             ["inspect", "-f", "{{.State.Running}}", name], check=False,
         )
         if code != 0:
-            await self._docker([
-                "run", "-d", "--name", name, "--restart", "unless-stopped",
-                "--network", "bridge", "--memory", "512m", "--pids-limit", "256",
-                "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
-                "--mount", f"type=volume,source={name},target={WORKSPACE_ROOT}",
-                "--entrypoint", "sleep", self.image, "infinity",
-            ])
+            try:
+                await self._docker([
+                    "run", "-d", "--name", name, "--restart", "unless-stopped",
+                    "--network", "bridge", "--memory", "512m", "--pids-limit", "256",
+                    "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
+                    "--mount", f"type=volume,source={name},target={WORKSPACE_ROOT}",
+                    "--entrypoint", "sleep", self.image, "infinity",
+                ])
+            except RuntimeError as exc:
+                # 并发下另一个调用可能刚好建好容器，视为成功
+                if "already in use" not in str(exc) and "Conflict" not in str(exc):
+                    raise
+                await self._docker(["start", name])
         elif out.strip() != "true":
             await self._docker(["start", name])
         return CustomerWorkspace(container_name=name, volume_name=name)

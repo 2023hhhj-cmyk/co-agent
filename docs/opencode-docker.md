@@ -41,7 +41,7 @@ OC_SANDBOX_MEMORY=1g
 OC_SANDBOX_CPUS=1
 # opencode-go provider key；留空时回退读取宿主机 opencode 登录态。
 OPENCODE_API_KEY=
-OPENCODE_MODEL=opencode-go/deepseek-v4-pro
+OPENCODE_MODEL=opencode-go/deepseek-v4.1-flash
 OPENCODE_AGENT=build
 ```
 

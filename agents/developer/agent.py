@@ -17,7 +17,9 @@ from typing import Any, Optional
 from agents.base import BaseAgent
 from models.agent import ActionDef, AgentRole, ReactMode
 from models.message import Message
+from config.settings import settings
 from tools.code.opencode import OpenCodeTool
+from workflows.state import rel_path
 from tools.deploy.customer_container import ContainerFiles, HostFiles, validate_docker_name
 from tools.llm.client import LLMClient
 
@@ -72,7 +74,7 @@ class DeveloperAgent(BaseAgent):
             **kwargs,
         )
         self.base_dir = base_dir
-        self.opencode = OpenCodeTool(base_dir=base_dir, timeout=900)
+        self.opencode = OpenCodeTool(base_dir=base_dir, timeout=settings.OC_TASK_TIMEOUT)
 
     async def _think(self, messages: list[Message]) -> Optional[ActionDef]:
         """只处理 CEO 派来的一项任务，不根据自己的产出再选下一步。"""
@@ -130,7 +132,7 @@ class DeveloperAgent(BaseAgent):
         except ValueError as exc:
             return Message(content=str(exc), cause_by="error", sent_from=self.agent_id)
 
-        design_excerpt = await files.read(design_doc_path)
+        design_excerpt = (await files.read(design_doc_path))[:2000]
         items = await self._make_plan(task_id, title, description, acceptance)
         work_dir = os.path.join(client_dir, "tasks", task_id)
         await files.makedirs(work_dir)
@@ -200,6 +202,10 @@ class DeveloperAgent(BaseAgent):
                 "volume_name": volume_name,
                 "task_id": task_id,
                 "ok": ok,
+                "files": [rel_path(p, client_dir, "/workspace") for p in outputs.values() if p],
+                "acceptance_text": acceptance_text,
+                "passed": ok,
+                "error": "" if ok else acceptance_text,
             },
         )
 
@@ -277,6 +283,11 @@ class DeveloperAgent(BaseAgent):
         task = f"只实现这一项：{item.detail}"
         if item.output_file:
             task += f"\n完成后把结果写入相对路径 {item.output_file}。不要改这一项之外的范围。"
+        task += (
+            "\n\n环境限制（重要）：这个工作区没有浏览器、没有图形界面。"
+            "不要安装或调用 chrome/playwright/selenium，不要联网校验，不要运行 find /、which、curl 之类的环境探测。"
+            "第一步就直接用 write 工具创建目标文件并写完整内容，然后再做文件级自检（读回文件确认），完成后立即结束。"
+        )
         result = await self.opencode.execute(
             task=task, context=context, working_dir=client_dir, volume=volume or None,
         )
@@ -351,10 +362,12 @@ class DeveloperAgent(BaseAgent):
         for item in items:
             if item.output_file and item.output_file not in files:
                 files.append(item.output_file)
-        for match in _FILE_RE.findall(acceptance or ""):
-            rel = self._safe_rel(match)
-            if rel and rel not in files:
-                files.append(rel)
+        if not files:
+            # 只在计划没有声明输出文件时，才退回从验收文字里推断文件名。
+            for match in _FILE_RE.findall(acceptance or ""):
+                rel = self._safe_rel(match)
+                if rel and rel not in files:
+                    files.append(rel)
         return files
 
     def _task_description(self, message: Message) -> str:

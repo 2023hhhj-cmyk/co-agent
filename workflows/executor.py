@@ -85,7 +85,12 @@ class AgentNodeExecutor(NodeExecutor):
             raise ValueError(f"Agent not found for role: {role}")
         logger.info(f"DEBUG AgentNodeExecutor: node={node_id} role={role} agent={type(self.agents[role]).__name__}")
 
-        agent = self.agents[role]
+        base_agent = self.agents[role]
+        # 每个任务一个执行上下文：共享 LLM/工具/记忆服务，隔离队列与工作记忆
+        agent = (
+            base_agent.fork(context.get("client_id", ""))
+            if hasattr(base_agent, "fork") else base_agent
+        )
 
         # 优先使用 CEO 拆解的任务描述（动态 DAG 场景）
         task_desc = context.get("task_descriptions", {}).get(node_id)
@@ -259,7 +264,11 @@ class WorkflowExecutor:
                             "error": str(result),
                         }
                     else:
-                        context["outputs"][node_id] = result.to_dict()
+                        node_out = result.to_dict()
+                        # 返回错误 Message 而未抛异常的节点，同样记为失败
+                        if getattr(result, "cause_by", "") in ("error", "failed"):
+                            node_out["error"] = (result.content or "节点返回失败")[:200]
+                        context["outputs"][node_id] = node_out
                         # 更新输入消息为当前节点的输出（供下一层使用）
                         input_message = result
 

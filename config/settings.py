@@ -23,12 +23,15 @@ class Settings(BaseSettings):
     DASHSCOPE_EMBEDDING_DIMENSIONS: int = 1024
     DEEPSEEK_API_KEY: str = ""
     DEEPSEEK_BASE_URL: str = "https://api.deepseek.com/v1"
-    DEEPSEEK_MODEL: str = "deepseek-v4-pro"
+    DEEPSEEK_MODEL: str = "deepseek-v4.1-flash"
     # Docker 中的 opencode 仅接收这些模型配置，不转发平台其他凭证。
     OC_SANDBOX_IMAGE: str = "muzhu-sandbox:latest"
-    OC_SANDBOX_MEMORY: str = "1g"
+    OC_SANDBOX_MEMORY: str = "1536m"
     OC_SANDBOX_CPUS: float = Field(default=1.0, gt=0)
-    OPENCODE_MODEL: str = "opencode-go/deepseek-v4-pro"
+    OC_TASK_TIMEOUT: int = 1500
+    # 对外访问基址：部署消息、Webhook 健康检查都用它，避免硬编码域名
+    PUBLIC_BASE_URL: str = "https://www.loveboos-ai.com"
+    OPENCODE_MODEL: str = "opencode-go/deepseek-v4-flash"
     OPENCODE_AGENT: str = "build"
     OPENCODE_API_KEY: str = Field(default="", repr=False)  # opencode-go provider key (oc_sk_...)
     # 旧版 Anthropic API 客户端（ClaudeClient）仍在使用，保留该字段。

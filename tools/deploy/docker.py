@@ -46,20 +46,20 @@ class PortManager:
         if not self.database:
             return
         rows = await self.database.fetch(
-            "SELECT port, service_name FROM deployments "
+            "SELECT port, deployment_id FROM deployments "
             "WHERE port > 0 AND status <> 'stopped'"
         )
         for row in rows:
-            self.allocated[int(row["port"])] = row["service_name"]
+            self.allocated[int(row["port"])] = row["deployment_id"]
         if self.allocated:
             self._next_port = max(self.allocated) + 1
         logger.info("restored %s ports", len(self.allocated))
 
-    async def allocate(self, service_name: str) -> int:
+    async def allocate(self, deployment_id: str) -> int:
         """分配端口。先认领数据库里的空闲端口，再记到内存。"""
-        for port, name in self.allocated.items():
-            if name == service_name:
-                logger.info("reuse port %s for %s", port, service_name)
+        for port, owner in self.allocated.items():
+            if owner == deployment_id:
+                logger.info("reuse port %s for %s", port, deployment_id)
                 return port
 
         while self._next_port <= self.end:
@@ -92,7 +92,7 @@ class PortManager:
                 )
                 if not row:
                     continue
-            self.allocated[port] = service_name
+            self.allocated[port] = deployment_id
             logger.info("allocated port %s for %s", port, service_name)
             return port
 
@@ -100,36 +100,15 @@ class PortManager:
 
     async def release(self, port: int):
         """释放端口，并把数据库记录标成已停止。"""
-        service_name = self.allocated.pop(port, None)
-        if service_name and self.database:
+        deployment_id = self.allocated.pop(port, None)
+        if deployment_id and self.database:
             await self.database.execute(
-                "UPDATE deployments SET status = 'stopped', updated_at = NOW() "
-                "WHERE service_name = $1 AND port = $2",
-                service_name, port,
+                "UPDATE deployments SET status = 'stopped', port = 0, updated_at = NOW() "
+                "WHERE deployment_id = $1 AND port = $2",
+                deployment_id, port,
             )
-        if service_name:
-            logger.info("released port %s for %s", port, service_name)
-
-    async def release_by_service(self, service_name: str):
-        """释放服务占用的端口。"""
-        ports = [port for port, name in self.allocated.items() if name == service_name]
-        for port in ports:
-            await self.release(port)
-
-    def get_port(self, service_name: str) -> Optional[int]:
-        """
-        获取服务的端口
-
-        Args:
-            service_name: 服务名称
-
-        Returns:
-            Optional[int]: 端口号，如果未分配则返回 None
-        """
-        for port, name in self.allocated.items():
-            if name == service_name:
-                return port
-        return None
+        if deployment_id:
+            logger.info("released port %s for %s", port, deployment_id)
 
     def get_all_allocated(self) -> dict[int, str]:
         """获取所有已分配的端口"""

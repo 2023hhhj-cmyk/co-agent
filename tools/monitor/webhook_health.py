@@ -23,13 +23,17 @@ from urllib.parse import urlencode
 
 import httpx
 
+from config.settings import settings
+
 logger = logging.getLogger(__name__)
 
+_BASE = settings.PUBLIC_BASE_URL.rstrip("/")
+
 # 检测的回调 URL（3 个）
-WECOM_CEO_URL = os.environ.get("WECOM_CEO_CALLBACK_TEST_URL", "https://loveboos-ai.com/api/wecom/ceo/callback")
-WECOM_CS_URL = os.environ.get("WECOM_CS_CALLBACK_TEST_URL", "https://loveboos-ai.com/api/wecom/cs/callback")
-FEISHU_URL = os.environ.get("FEISHU_WEBHOOK_TEST_URL", "https://loveboos-ai.com/api/feishu/webhook")
-LOVEBOOS_REDIRECT_URL = "https://loveboos-ai.com/"  # 用于测错配的重定向
+WECOM_CEO_URL = os.environ.get("WECOM_CEO_CALLBACK_TEST_URL", f"{_BASE}/api/wecom/ceo/callback")
+WECOM_CS_URL = os.environ.get("WECOM_CS_CALLBACK_TEST_URL", f"{_BASE}/api/wecom/cs/callback")
+FEISHU_URL = os.environ.get("FEISHU_WEBHOOK_TEST_URL", f"{_BASE}/api/feishu/webhook")
+PUBLIC_REDIRECT_URL = f"{_BASE}/"  # 用于测错配的重定向
 
 CHECK_INTERVAL_SECONDS = 3600
 HTTP_TIMEOUT_SECONDS = 10
@@ -152,10 +156,12 @@ async def run_webhook_health_check() -> dict:
         ("wecom_cs", WECOM_CS_URL),
         ("feishu_webhook", FEISHU_URL),
     ]:
+        # 检查是同步阻塞的，必须放线程池：否则会卡住事件循环，
+        # 而请求又要绕回本进程（域名 -> nginx -> 8080），必然超时。
         if name.startswith("feishu"):
-            ok, msg = _check_feishu(url)
+            ok, msg = await asyncio.to_thread(_check_feishu, url)
         else:
-            ok, msg = _check_wecom(url, name)
+            ok, msg = await asyncio.to_thread(_check_wecom, url, name)
         results[name] = {"url": url, "ok": ok, "msg": msg}
         status = "✓" if ok else "✗"
         _log(f"{status} {name} ({url}): {msg}")

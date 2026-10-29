@@ -145,6 +145,7 @@ class ProjectPlan(BaseModel):
     current_phase: str = "planning"
     status: str = "planning"       # planning / confirmed / executing / completed / partial / failed
     chat_id: str = ""              # 飞书会话 ID
+    client_id: str = ""            # 客户标识：记忆/部署的隔离单位
     user_message_id: str = ""      # 触发计划的飞书消息 ID
     creator_sender_id: str = ""    # P0 #5 修复：发起计划的发送者 open_id，用于横向越权防护
     created_at: datetime = Field(default_factory=datetime.now)

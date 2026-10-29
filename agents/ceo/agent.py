@@ -55,6 +55,9 @@ _current_chat_id: contextvars.ContextVar[str] = contextvars.ContextVar(
 _current_chat_type: contextvars.ContextVar[str] = contextvars.ContextVar(
     "ceo_current_chat_type", default="p2p"
 )
+_current_client_id: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "ceo_current_client_id", default=""
+)
 
 # CEO 角色定义
 CEO_ROLE = AgentRole(
@@ -166,6 +169,7 @@ class CEOAgent(BaseAgent):
         message_id: str,
         sender_id: str = "",
         chat_type: str = "p2p",
+        client_id: str = "",
     ) -> None:
         """
         处理来自飞书的消息（主入口）
@@ -190,6 +194,7 @@ class CEOAgent(BaseAgent):
         _current_chat_id.set(chat_id)
         _current_sender_id.set(sender_id)
         _current_chat_type.set(chat_type)
+        _current_client_id.set(client_id or "")
 
         # 埋点：feishu.message.received（去重后）
         emit_event("feishu.message.received", user_id_hash=hash_id(sender_id), msg_len=len(text))
@@ -517,7 +522,7 @@ assigned_to 只能是 developer、frontend_expert、devops。"""
 
     async def _write_client_design_doc(self, plan: ProjectPlan) -> None:
         """为客户创建一个长期容器，并把需求文档写入容器里的 /workspace。"""
-        label = self._client_label(plan.requirement, plan.chat_id)
+        label = _current_client_id.get() or self._client_label(plan.requirement, plan.chat_id)
         plan.client_id = label
         api = getattr(self, "customer_containers", None) or CustomerContainers()
         self.customer_containers = api
@@ -895,6 +900,12 @@ assigned_to 只能是 developer、frontend_expert、devops。"""
         """处理一般性问题"""
         response = await self._get_general_answer(text)
         await self._send_feishu_text(chat_id, response)
+
+
+    async def handle_channel_message(self, client_id: str, text: str, message_id: str) -> str:
+        """处理非飞书渠道的消息，并保留这个请求的客户编号。"""
+        _current_client_id.set(client_id)
+        return await self._get_general_answer(text)
 
     async def _get_general_answer(self, text: str) -> str:
         """获取一般性问题的答案（返回字符串，不发送消息）"""

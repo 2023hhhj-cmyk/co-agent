@@ -597,13 +597,15 @@ async def get_workflow():
 
 
 @app.get("/api/devops/services")
-async def get_devops_services():
-    """获取所有已部署的服务"""
+async def get_devops_services(client_id: str = ""):
+    """只返回指定客户的部署。"""
+    if not client_id:
+        return {"error": "client_id is required"}
     devops = agents.get("devops")
     if not devops:
         return {"error": "DevOps agent not available"}
 
-    services = devops.get_all_services()
+    services = devops.get_all_services(client_id)
     return {
         "total": len(services),
         "services": services,
@@ -611,13 +613,15 @@ async def get_devops_services():
 
 
 @app.get("/api/devops/deployments/{deployment_id}")
-async def get_devops_service_detail(deployment_id: str):
+async def get_devops_service_detail(deployment_id: str, client_id: str = ""):
     """获取单个服务的详细信息"""
     devops = agents.get("devops")
     if not devops:
         return {"error": "DevOps agent not available"}
 
-    detail = devops.get_service_detail(deployment_id)
+    if not client_id:
+        return {"error": "client_id is required"}
+    detail = devops.get_service_detail(deployment_id, client_id)
     if not detail:
         return {"error": f"Deployment not found: {deployment_id}"}
 
@@ -625,15 +629,17 @@ async def get_devops_service_detail(deployment_id: str):
 
 
 @app.post("/api/devops/deployments/{deployment_id}/restart")
-async def restart_devops_service(deployment_id: str):
+async def restart_devops_service(deployment_id: str, client_id: str = ""):
     """重启一个部署。只接受 deployment_id。"""
     devops = agents.get("devops")
     if not devops:
         return {"error": "DevOps agent not available"}
 
-    service = devops.get_deployment(deployment_id)
+    if not client_id:
+        return {"error": "client_id is required"}
+    service = devops.get_deployment(deployment_id, client_id)
     if not service:
-        return {"error": f"Deployment not found: {deployment_id}"}
+        return {"error": "Deployment not found"}
     success = await devops.docker.restart(service.container_name)
 
     if success:
@@ -643,15 +649,17 @@ async def restart_devops_service(deployment_id: str):
 
 
 @app.post("/api/devops/deployments/{deployment_id}/stop")
-async def stop_devops_service(deployment_id: str):
+async def stop_devops_service(deployment_id: str, client_id: str = ""):
     """停止一个部署。只接受 deployment_id。"""
     devops = agents.get("devops")
     if not devops:
         return {"error": "DevOps agent not available"}
 
-    service = devops.get_deployment(deployment_id)
+    if not client_id:
+        return {"error": "client_id is required"}
+    service = devops.get_deployment(deployment_id, client_id)
     if not service:
-        return {"error": f"Deployment not found: {deployment_id}"}
+        return {"error": "Deployment not found"}
 
     # 停止监控
     await devops.monitor.stop_monitoring(service.service_name)
@@ -780,7 +788,7 @@ async def feishu_webhook(request: Request):
             ceo = agents.get("ceo")
             if ceo:
                 asyncio.create_task(
-                    ceo.handle_feishu_message(chat_id, text, message_id, sender_id)
+                    ceo.handle_feishu_message(chat_id, text, message_id, sender_id, client_id=client_id)
                 )
             else:
                 logger.error("CEO Agent 未初始化")
@@ -918,7 +926,7 @@ async def wecom_ceo_callback(request: Request):
     if ceo:
         try:
             # CEO Agent 处理消息并回复
-            response = await ceo._get_general_answer(content)
+            response = await ceo.handle_channel_message(client_id, content, msg_id)
 
             # 通过智能机器人的 response_url 回复
             if response_url and response:

@@ -89,6 +89,10 @@ class MemoryManager:
         if agent_id in self._working:
             self._working[agent_id].clear()
 
+    def drop_working(self, agent_id: str) -> None:
+        """任务结束丢弃该执行上下文的工作记忆，避免 fork 后无限累积。"""
+        self._working.pop(agent_id, None)
+
     # ========== 统一写入 ==========
 
     async def remember(
@@ -521,7 +525,7 @@ class MemoryManager:
            "支付宝支付功能" → ["支付宝", "支付", "付功", "支付宝支", ...]
         """
         import re
-        words = re.split(r'[\s，。！？、；：""''（）\(\)\[\]【】,\.!\?;:]+', query)
+        words = re.split(r'[\s，。！？、；：“”‘’（）\(\)\[\]【】,\.!\?;:]+', query)
         keywords = [w.lower() for w in words if len(w) >= 2]
 
         # CJK 字符级 n-gram（弥补中文无空格分词的问题）

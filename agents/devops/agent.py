@@ -149,6 +149,7 @@ class DevOpsAgent(BaseAgent):
                 id=row["deployment_id"] or row["service_name"],
                 service_name=row["service_name"],
                 client_name=row["client_name"] or row["client_id"],
+                client_id=row["client_id"] or "",
                 client_dir=row["project_dir"] or "",
                 project_type=row["kind"] or "static",
                 container_name=row["container_name"] or "",
@@ -168,6 +169,8 @@ class DevOpsAgent(BaseAgent):
 
     async def _save_deployment(self, record: DeployRecord, client_id: str = "", site_root: str = "") -> None:
         """把一条部署记录写入数据库。"""
+        if client_id:
+            record.client_id = client_id
         self.deployed_services[record.id] = record
         if not self.database:
             return
@@ -343,7 +346,7 @@ class DevOpsAgent(BaseAgent):
                 raise Exception("镜像构建失败")
 
             # 第 5 步：分配端口并启动容器
-            port = await self.port_manager.allocate(service_name)
+            port = await self.port_manager.allocate(record.id)
             container_name = f"loveboos-{service_name}"
             logger.info(f"[4/7] 启动容器: {container_name}，端口: {port}")
 
@@ -1037,11 +1040,14 @@ class DevOpsAgent(BaseAgent):
     # ========== Web 接口预留 ==========
 
 
-    def get_deployment(self, deployment_id: str) -> Optional[DeployRecord]:
-        """只按 deployment_id 找记录，不接受服务名。"""
-        return self.deployed_services.get(deployment_id)
+    def get_deployment(self, deployment_id: str, client_id: str = "") -> Optional[DeployRecord]:
+        """按 deployment_id 找记录；传了 client_id 时必须匹配。"""
+        record = self.deployed_services.get(deployment_id)
+        if not record or not client_id or record.client_id != client_id:
+            return None
+        return record
 
-    def get_all_services(self) -> list[dict]:
+    def get_all_services(self, client_id: str = "") -> list[dict]:
         """
         获取所有已部署服务的状态（Web 接口用）
 
@@ -1050,9 +1056,11 @@ class DevOpsAgent(BaseAgent):
         """
         services = []
         for deployment_id, record in self.deployed_services.items():
+            if client_id and record.client_id != client_id:
+                continue
             services.append({
                 "deployment_id": deployment_id,
-                "client_id": record.client_name,
+                "client_id": record.client_id,
                 "service_name": record.service_name,
                 "client_name": record.client_name,
                 "project_type": record.project_type,
@@ -1069,7 +1077,7 @@ class DevOpsAgent(BaseAgent):
             })
         return services
 
-    def get_service_detail(self, deployment_id: str) -> Optional[dict]:
+    def get_service_detail(self, deployment_id: str, client_id: str = "") -> Optional[dict]:
         """
         获取单个服务的详细信息（Web 接口用）
 
@@ -1079,7 +1087,7 @@ class DevOpsAgent(BaseAgent):
         Returns:
             Optional[dict]: 服务详细信息
         """
-        record = self.get_deployment(deployment_id)
+        record = self.get_deployment(deployment_id, client_id)
         if not record:
             return None
 

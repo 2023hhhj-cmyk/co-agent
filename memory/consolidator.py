@@ -54,6 +54,39 @@ CONSOLIDATION_SYSTEM_PROMPT = """你是一个记忆提炼器。从以下 Agent �
 """
 
 
+def _repair_truncated_json(text: str) -> Optional[str]:
+    """把被截断的 JSON 补成可解析的形式（补引号、闭合未闭合的括号）。"""
+    start = text.find("{")
+    if start < 0:
+        return None
+    text = text[start:].rstrip()
+    if text.endswith(","):
+        text = text[:-1]
+    stack: list[str] = []
+    in_string = False
+    escape = False
+    for ch in text:
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+        else:
+            if ch == '"':
+                in_string = True
+            elif ch in "[{":
+                stack.append(ch)
+            elif ch in "]}":
+                if stack:
+                    stack.pop()
+    if in_string:
+        text += '"'
+    text += "".join("]" if c == "[" else "}" for c in reversed(stack))
+    return text
+
+
 class MemoryConsolidator:
     """LLM 驱动的记忆提炼器"""
 
@@ -119,7 +152,9 @@ class MemoryConsolidator:
             response = await self.llm.chat(
                 llm_messages,
                 temperature=0.2,
-                max_tokens=500,
+                max_tokens=1500,
+                # 提炼是一次性转换，缓存既浪费内存，也会把截断结果反复喂回来
+                use_cache=False,
             )
 
             result = self._parse_response(response)
@@ -191,7 +226,14 @@ class MemoryConsolidator:
             text = "\n".join(lines)
 
         try:
-            data = json.loads(text)
+            try:
+                data = json.loads(text)
+            except json.JSONDecodeError:
+                repaired = _repair_truncated_json(text)
+                if not repaired:
+                    raise
+                data = json.loads(repaired)
+                logger.warning("提炼结果 JSON 被截断，已补全结构后解析")
             # 验证必要字段
             if "summary" not in data:
                 logger.warning("LLM 返回的 JSON 缺少 summary 字段")
