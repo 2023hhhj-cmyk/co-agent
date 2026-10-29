@@ -102,11 +102,8 @@ workflows/       工作流引擎（DAG + 拓扑排序）
 - **HTTP 限流**：显式装饰的 Webhook 为 120 req/min；默认 60 req/min 尚缺全局中间件接入
 - **安全头**：nosniff / DENY / HSTS
 
-## 项目资料与面试复习
+## 项目资料
 
-- [项目介绍摘要](docs/interview/RESUME_PROJECT.md)：准备面试开场的项目介绍。
-- [面试复习主指南](docs/interview/resume.md)：按模块复习，并定位对应代码。
-- [技术追问资料](docs/interview/interview_pre.md)：并发、通信、部署和记忆的深入问答。
 - [完整产品规格](docs/product.md)
 - [埋点事件与指标规范](analytics/analytics_spec.md)
 - [埋点运维说明](analytics/analytics_ops_notes.md)

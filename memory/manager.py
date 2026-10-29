@@ -24,7 +24,7 @@ from memory.session import SessionMemory
 from memory.working import WorkingMemory
 
 try:
-    from analytics import emit_event  # 埋点（agent 简历数据采集）
+    from analytics import emit_event  # 埋点（运行数据采集）
 except Exception:  # noqa: BLE001
     def emit_event(*_a, **_kw):  # type: ignore[no-redef]
         return None

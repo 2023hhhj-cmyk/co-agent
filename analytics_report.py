@@ -1,5 +1,5 @@
 """
-analytics_report.py — 从 analytics_events.log 产出 5 个简历指标 + 事件分布。
+analytics_report.py — 从 analytics_events.log 产出 5 个运行指标 + 事件分布。
 
 用法：
     python analytics_report.py                 # 默认读 ./analytics_events.log
@@ -94,7 +94,7 @@ def main() -> int:
     for name, n in counter.most_common():
         print(f"  {n:>5}  {name}")
 
-    print("\n=== 5 个简历指标 ===")
+    print("\n=== 5 个运行指标 ===")
     starts = [e for e in events if e["event"] == "workflow.start"]
     ends = [e for e in events if e["event"] == "workflow.end"]
     recv = [e for e in events if e["event"] == "feishu.message.received"]

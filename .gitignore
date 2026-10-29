@@ -31,3 +31,11 @@ coverage.xml
 # 本地工具配置（不入库）
 .claude/settings.local.json
 .vscode/
+
+# 个人简历与面试资料
+**/*[Rr][Ee][Ss][Uu][Mm][Ee]*
+**/[Cc][Vv].*
+**/[Cc][Vv]/
+**/*简历*
+**/*求职*
+/docs/interview/

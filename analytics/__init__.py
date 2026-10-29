@@ -1,5 +1,5 @@
 """
-Analytics 埋点助手 — 为 Agent 岗简历采集真实可量化的运行数据。
+Analytics 埋点助手 — 采集真实可量化的运行数据。
 
 设计原则：
 - 失败隔离：emit_event 内 try/except 吞掉所有异常，绝不阻塞主流程。

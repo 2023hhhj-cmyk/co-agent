@@ -15,7 +15,7 @@ import time
 from typing import Optional
 
 try:
-    from analytics import emit_event, hash_args  # 埋点（agent 简历数据采集）
+    from analytics import emit_event, hash_args  # 埋点（运行数据采集）
 except Exception:  # noqa: BLE001
     def emit_event(*_a, **_kw):  # type: ignore[no-redef]
         return None

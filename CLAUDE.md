@@ -99,23 +99,23 @@ Agent 执行层 (MetaGPT Think-Act-Observe)
 
 ## 埋点系统（analytics）✅ 已实现
 
-为简历采集可量化的真实运行数据。配套 4 个文件：
+采集可量化的真实运行数据。配套 4 个文件：
 
 - `analytics/__init__.py` — 写入器，NDJSON 追加到 `analytics/logs/analytics_events.log`（可用 `ANALYTICS_LOG_PATH` 覆盖）
-- `analytics/analytics_spec.md` — 11 个事件类型定义 + 5 个简历指标公式
+- `analytics/analytics_spec.md` — 11 个事件类型定义 + 5 个运行指标公式
 - `analytics/analytics_ops_notes.md` — 运维注意事项（多进程丢行 / logrotate / 隐私红线）
 - `analytics/report.py` — 统计脚本，一行命令产出 5 个指标
 
 **11 个事件**：`feishu.message.received` / `input.guard.rejected` / `agent.think` / `agent.act` / `agent.error` / `tool.call` / `memory.recall` / `memory.distill` / `workflow.start` / `workflow.node` / `workflow.end`
 
-**报告的 5 个统计项**：已结束工作流成功率 / P95 延迟 / 并行比值代理 / think 阶段 tokens/task / 输入拒绝比例。统计口径和简历使用限制见 `analytics/analytics_spec.md`，不能直接当作实测加速比、金额成本或攻击检测准确率。
+**报告的 5 个统计项**：已结束工作流成功率 / P95 延迟 / 并行比值代理 / think 阶段 tokens/task / 输入拒绝比例。统计口径和使用限制见 `analytics/analytics_spec.md`，不能直接当作实测加速比、金额成本或攻击检测准确率。
 
 ```bash
 # 实时观察（部署时调试用）
 ANALYTICS_VERBOSE=1 python main.py
 
-# 产出简历数字
-python analytics/report.py > resume_metrics.txt
+# 产出运行指标
+python analytics/report.py > metrics_report.txt
 ```
 
 **已知限制**：单 Lock 串行化，多 worker 会丢行（生产前如要水平扩展需改 Redis Stream）；无日志轮转（生产前需加 logrotate）。
