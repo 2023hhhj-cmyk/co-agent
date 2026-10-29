@@ -75,7 +75,7 @@ python main.py
 ## 项目结构
 
 ```
-docs/            产品规格、面试复习、安全审查
+docs/            产品规格、安全审查
 analytics/       埋点代码、统计脚本、规范和运行日志
 tests/           测试代码、样例数据、覆盖率配置与生成报告
 agents/          Agent 角色实现（CEO、Dev、DevOps 等）
