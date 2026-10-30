@@ -21,7 +21,8 @@ class TestExceptionStackTraces:
         critical_loggers = [
             "意图分类失败",
             "需求完整性检查失败",
-            "任务拆解失败",
+            "需求文档生成失败",
+            "任务调配失败",
             "工作流执行失败",
             "读取项目文件失败",
             "飞书发送失败",
@@ -365,3 +366,24 @@ class TestWebhookIdempotency:
         with open("main.py") as f:
             source = f.read()
         assert "feishu_msg:" in source, "飞书 webhook 应有 dedup key prefix"
+
+@pytest.mark.parametrize("failure_stage,expected_log", [
+    ("design", "需求文档生成失败"),
+    ("allocation", "任务调配失败"),
+])
+async def test_ceo_planning_errors_log_stack_and_use_fallback(failure_stage, expected_log):
+    from agents.ceo.agent import CEOAgent
+
+    ceo = CEOAgent.__new__(CEOAgent)
+    ceo.llm = object()
+    ceo._write_design_doc = AsyncMock(return_value="design")
+    ceo._allocate_tasks = AsyncMock(return_value=[])
+    ceo._write_client_design_doc = AsyncMock()
+    target = ceo._write_design_doc if failure_stage == "design" else ceo._allocate_tasks
+    target.side_effect = ValueError("planning failed")
+    with patch("agents.ceo.agent.logger.error") as log:
+        plan = await ceo._decompose_tasks("requirement", "chat", "message")
+    assert plan is not None and plan.tasks
+    log.assert_called_once()
+    assert expected_log in log.call_args.args[0]
+    assert log.call_args.kwargs.get("exc_info") is True

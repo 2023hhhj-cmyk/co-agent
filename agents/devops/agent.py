@@ -15,6 +15,7 @@
 
 import asyncio
 import glob
+import json
 import logging
 import os
 import re
@@ -33,6 +34,7 @@ from models.message import Message
 from tools.code.opencode import OpenCodeTool
 from tools.deploy.analyzer import ProjectAnalyzer
 from tools.deploy.docker import DockerManager, PortManager
+from tools.deploy.customer_container import container_name_for
 from tools.deploy.monitor import ServiceMonitor
 from tools.deploy.nginx import NginxManager
 from tools.llm.client import LLMClient
@@ -142,7 +144,7 @@ class DevOpsAgent(BaseAgent):
         if not self.database:
             return
         rows = await self.database.fetch(
-            "SELECT * FROM deployments WHERE status <> 'stopped'"
+            "SELECT * FROM deployments WHERE status <> 'stopped' OR container_name LIKE 'coagent-app-d%'"
         )
         for row in rows:
             record = DeployRecord(
@@ -158,12 +160,19 @@ class DevOpsAgent(BaseAgent):
                 status=row["status"] or "running",
                 error_message=row["error_message"],
             )
-            if record.container_name:
+            if record.container_name and record.status != ServiceStatus.STOPPED:
                 running = await self.docker.is_running(record.container_name)
                 if not running:
                     record.mark_failed("container missing after restart")
                     await self._save_deployment(record, row["client_id"] or "", row["site_root"] or "")
             self.deployed_services[record.id] = record
+            if record.container_name.startswith("coagent-app-d") and record.status == ServiceStatus.RUNNING:
+                try:
+                    await self.refresh_runtime_route(record)
+                    await self.monitor.start_monitoring(record)
+                except Exception as exc:
+                    record.mark_failed(f"恢复运行服务失败: {type(exc).__name__}")
+                    await self._save_deployment(record, record.client_id)
         await self.port_manager.load_allocated()
         logger.info("restored %s deployments", len(self.deployed_services))
 
@@ -189,7 +198,7 @@ class DevOpsAgent(BaseAgent):
             "updated_at = NOW()",
             deployment_id,
             record.service_name,
-            client_id or record.client_name,
+            client_id or record.client_id or record.client_name,
             record.client_name,
             record.project_type or "static",
             int(record.port or 0),
@@ -273,8 +282,13 @@ class DevOpsAgent(BaseAgent):
             return Message(content="部署被拒绝：源目录不在允许范围内", cause_by="error", sent_from=self.agent_id)
         project_dir = os.path.realpath(host_dir)
         client_name = (last_message.metadata or {}).get("client_name") or client_id
-        self._deploy_client_id = client_id
         service_name = self._generate_service_name(client_name)
+
+        # Project manifests take precedence over upstream file extensions.
+        if os.path.isfile(os.path.join(project_dir, "package.json")):
+            return await self._deploy_node_project(project_dir, client_name, service_name, client_id)
+        if any(os.path.isfile(os.path.join(project_dir, name)) for name in ("server.py", "app.py", "main.py")):
+            return await self._deploy_python_project(project_dir, client_name, service_name, client_id)
 
         # ponytail: 先看上游声明的产物，再决定用静态托管还是容器化。
         # 有声明就不扫目录；没有声明才回退到旧的 index.html 探测。
@@ -290,7 +304,7 @@ class DevOpsAgent(BaseAgent):
                     sent_from=self.agent_id,
                 )
             logger.info(f"上游声明为纯静态项目（{len(declared)} 个文件），跳过容器化: {declared[:8]}")
-            return await self._static_deploy(project_dir, client_name, service_name)
+            return await self._static_deploy(project_dir, client_name, service_name, client_id)
 
         if verdict is False:
             logger.info("上游声明包含后端/构建文件，走容器化部署，跳过静态判断")
@@ -298,7 +312,7 @@ class DevOpsAgent(BaseAgent):
         if verdict is None:
             index_html = os.path.join(project_dir, "index.html")
             if os.path.exists(index_html):
-                return await self._static_deploy(project_dir, client_name, service_name)
+                return await self._static_deploy(project_dir, client_name, service_name, client_id)
 
         logger.info(f"开始部署: {service_name}，项目目录: {project_dir}")
 
@@ -368,8 +382,8 @@ class DevOpsAgent(BaseAgent):
             # 第 6 步：配置 Nginx
             logger.info(f"[5/7] 配置 Nginx: {service_name} -> port {port}")
             nginx_ok = await self.nginx.add_service(service_name, port)
-            if nginx_ok:
-                await self.nginx.reload()
+            if not nginx_ok or not await self.nginx.reload():
+                raise RuntimeError("Nginx 配置或重载失败")
 
             # 第 7 步：健康检查
             logger.info("[6/7] 执行健康检查")
@@ -379,12 +393,12 @@ class DevOpsAgent(BaseAgent):
             record.update_health(health)
 
             if health.status.value != "healthy":
-                logger.warning(f"健康检查未通过，但服务已启动: {health.error}")
+                raise RuntimeError(f"部署健康检查未通过: {health.error}")
 
             # 第 8 步：启动监控
             logger.info("[7/7] 启动持续监控")
             record.mark_running()
-            await self._save_deployment(record, self._deploy_client_id)
+            await self._save_deployment(record, client_id)
             await self.monitor.start_monitoring(record)
 
             # 生成访问 URL
@@ -414,8 +428,16 @@ class DevOpsAgent(BaseAgent):
 
         except Exception as e:
             logger.error(f"部署失败: {service_name} - {e}")
+            if record.container_name:
+                await self.docker.stop(record.container_name)
+                await self.docker.remove(record.container_name)
+            if record.port:
+                await self.port_manager.release(record.port)
+            await self.nginx.remove_service(service_name)
+            await self.nginx.reload()
             record.mark_failed(str(e))
-            await self._save_deployment(record, self._deploy_client_id)
+            record.port = 0
+            await self._save_deployment(record, client_id)
 
             return Message(
                 content=f"部署失败: {str(e)}",
@@ -431,84 +453,346 @@ class DevOpsAgent(BaseAgent):
             )
 
     async def _static_deploy(
-        self, project_dir: str, client_name: str, service_name: str
+        self, project_dir: str, client_name: str, service_name: str, client_id: str = ""
     ) -> Message:
         """ponytail: 智能部署——根据项目类型自动选 Node/Python/纯静态。"""
         from pathlib import Path
         project = Path(project_dir)
         if (project / "package.json").exists():
-            return await self._deploy_node_project(project_dir, client_name, service_name)
+            return await self._deploy_node_project(project_dir, client_name, service_name, client_id)
         elif (project / "requirements.txt").exists() or (project / "pyproject.toml").exists():
-            return await self._deploy_python_project(project_dir, client_name, service_name)
+            return await self._deploy_python_project(project_dir, client_name, service_name, client_id)
         else:
-            return await self._deploy_static(project_dir, client_name, service_name)
+            return await self._deploy_static(project_dir, client_name, service_name, client_id)
+
+    @staticmethod
+    def _validate_node_lock(path: str) -> None:
+        from urllib.parse import urlsplit
+        with open(path, encoding="utf-8") as f:
+            lock = json.load(f)
+        if not isinstance(lock, dict) or lock.get("lockfileVersion") not in (2, 3):
+            raise ValueError("Node 依赖锁文件必须为 npm lockfile v2 或 v3")
+        packages = lock.get("packages")
+        if not isinstance(packages, dict):
+            raise ValueError("Node 锁文件缺少 packages")
+        for name, entry in packages.items():
+            if not isinstance(name, str) or name.startswith("/") or ".." in name.split("/") or not isinstance(entry, dict):
+                raise ValueError("Node 锁文件包含不安全路径")
+            if not name:
+                continue
+            if entry.get("link"):
+                raise ValueError("Node 锁文件不支持本地链接")
+            resolved = str(entry.get("resolved") or "")
+            parsed = urlsplit(resolved)
+            if (parsed.scheme != "https" or parsed.hostname != "registry.npmjs.org" or parsed.port not in (None, 443)
+                or parsed.username or parsed.password or parsed.query or parsed.fragment
+                or not str(entry.get("integrity") or "").startswith(("sha512-", "sha256-"))):
+                raise ValueError("Node 依赖必须来自 npm 官方仓库并包含完整性校验")
 
     async def _deploy_node_project(
-        self, project_dir: str, client_name: str, service_name: str
+        self, project_dir: str, client_name: str, service_name: str, client_id: str = ""
     ) -> Message:
-        """ponytail: Node/Vue/React 项目：npm install + build + 部署 dist/。"""
-        import subprocess
-        client_id = getattr(self, "_deploy_client_id", "") or client_name
-        deployment_id, safe_name, public_path, site_root = self._deployment_target(client_id, service_name)
-
-        async def _run(cmd, timeout=300):
-            proc = await asyncio.create_subprocess_exec(
-                *cmd, cwd=project_dir, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-            )
-            try:
-                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-            except asyncio.TimeoutError:
-                proc.kill()
-                return False, "", f"timeout after {timeout}s"
-            return proc.returncode == 0, stdout.decode("utf-8", errors="replace"), stderr.decode("utf-8", errors="replace")
-
-        ok, _, err = await _run(["npm", "install", "--prefer-offline", "--no-audit", "--no-fund"], timeout=300)
-        if not ok:
-            return Message(content=f"npm install 失败:\n{err[:500]}", cause_by="deploy_failed", sent_from=self.agent_id)
-
-        ok, stdout, err = await _run(["npm", "run", "build"], timeout=300)
-        if not ok:
-            return Message(content=f"npm run build 失败:\n{stdout[-300:]}\n{err[-500:]}", cause_by="deploy_failed", sent_from=self.agent_id)
-
-        # 找 build 输出目录
-        dist_dir = None
-        for candidate in ["dist", "build", "public", ".next", "out"]:
-            p = os.path.join(project_dir, candidate)
-            if os.path.isdir(p):
-                dist_dir = p
-                break
-        if not dist_dir:
-            return Message(content="build 完成但找不到 dist/ build/ public/ .next/ out/ 任何输出目录", cause_by="deploy_failed", sent_from=self.agent_id)
-
-        # 复制 dist/ 到 nginx 目录
+        """Install pinned npm packages without scripts, then build with no network."""
         import shutil
-        if os.path.exists(site_root):
-            shutil.rmtree(site_root)
-        shutil.copytree(dist_dir, site_root)
+        import tempfile
+        from pathlib import Path
+        temp = tempfile.mkdtemp(prefix="coagent-build-", dir="/tmp")
+        base_name = "coagent-build-" + uuid.uuid4().hex[:16]
+        install_name, build_name = base_name + "-install", base_name + "-build"
+        try:
+            source = Path(project_dir)
+            for root, dirs, files in os.walk(source, followlinks=False):
+                if any((Path(root) / n).is_symlink() for n in dirs + files):
+                    raise ValueError("构建输入含符号链接")
+            if (source / ".npmrc").exists():
+                raise ValueError("Node 项目不得覆盖 npm 注册表配置")
+            manifest = json.loads((source / "package.json").read_text())
+            if not isinstance(manifest, dict):
+                raise ValueError("package.json 格式错误")
+            if any(manifest.get(key) for key in ("workspaces", "overrides", "resolutions", "bundledDependencies", "bundleDependencies")):
+                raise ValueError("Node 项目暂不支持 workspaces、overrides 或 bundled dependencies")
+            requirements = {}
+            for section in ("dependencies", "devDependencies", "optionalDependencies", "peerDependencies"):
+                group = manifest.get(section) or {}
+                if not isinstance(group, dict):
+                    raise ValueError("Node 依赖格式错误")
+                for name, version in group.items():
+                    if not isinstance(name, str) or not re.fullmatch(r"(?:@[a-z0-9_.-]+/)?[a-z0-9_.-]+", name) or not isinstance(version, str) or not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?", version):
+                        raise ValueError("Node 依赖仅支持官方仓库固定版本")
+                    requirements[name] = version
+            if len(requirements) > 50:
+                raise ValueError("Node 依赖超过 50 项限制")
+            source_lock = source / "package-lock.json"
+            if (source / "npm-shrinkwrap.json").exists():
+                raise ValueError("Node 项目不支持 npm-shrinkwrap.json")
+            if requirements and not source_lock.is_file():
+                raise ValueError("Node 第三方依赖需要经过校验的 package-lock.json")
+            if source_lock.exists():
+                self._validate_node_lock(str(source_lock))
+            work = os.path.join(temp, "work")
+            shutil.copytree(project_dir, work, ignore=shutil.ignore_patterns(".git", "node_modules", ".npmrc"))
+            os.chmod(temp, 0o755)
+            for root, dirs, files in os.walk(work):
+                os.chown(root, 65534, 65534)
+                for entry in files:
+                    os.chown(os.path.join(root, entry), 65534, 65534)
+            common = ["docker", "run", "--rm", "--pull=never", "--user", "65534:65534",
+                      "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--memory", "1g",
+                      "--cpus", "1", "--pids-limit", "128", "--read-only",
+                      "--tmpfs", "/tmp:rw,nosuid,nodev,size=256m", "-e", "HOME=/tmp",
+                      "-e", "npm_config_cache=/tmp/npm-cache", "-e", "npm_config_userconfig=/dev/null",
+                      "--mount", f"type=bind,src={work},dst=/work", "-w", "/work"]
+            async def run(cmd):
+                proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+                try:
+                    _, err = await asyncio.wait_for(proc.communicate(), timeout=300)
+                except (asyncio.TimeoutError, asyncio.CancelledError):
+                    proc.kill()
+                    await proc.wait()
+                    raise
+                if proc.returncode:
+                    raise RuntimeError("Node 构建步骤失败: " + err.decode(errors="replace")[-500:])
+            if requirements:
+                # No project scripts run while this installer has network access.
+                await run(common + ["--name", install_name, "--network", "bridge", "node:20-bookworm-slim",
+                                    "npm", "ci", "--ignore-scripts", "--no-audit", "--no-fund",
+                                    "--registry=https://registry.npmjs.org", "--fetch-timeout=30000"])
+                self._validate_node_lock(os.path.join(work, "package-lock.json"))
+                build = "npm rebuild --offline --no-audit --no-fund && npm run build"
+            else:
+                build = "npm install --offline --ignore-scripts --no-audit --no-fund && npm run build"
+            await run(common + ["--name", build_name, "--network", "none", "node:20-bookworm-slim", "sh", "-c", build])
+            for candidate in ("dist", "build", "out"):
+                result = os.path.join(work, candidate)
+                if os.path.isfile(os.path.join(result, "index.html")):
+                    deployed = await self._deploy_static(result, client_name, service_name, client_id)
+                    if deployed.cause_by == "deploy_complete":
+                        deployed.metadata["source_kind"] = "node_build"
+                        deployed.metadata["build_evidence"] = {"command": "npm run build", "exit_code": 0,
+                                                               "network": "none", "output": "dist/index.html" if candidate == "dist" else f"{candidate}/index.html"}
+                    return deployed
+            raise RuntimeError("构建未产出包含 index.html 的静态目录")
+        except Exception as exc:
+            return Message(content=str(exc), cause_by="deploy_failed", sent_from=self.agent_id)
+        finally:
+            for name in (install_name, build_name):
+                proc = await asyncio.create_subprocess_exec("docker", "rm", "-f", name, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+                await asyncio.shield(proc.wait())
+            shutil.rmtree(temp, ignore_errors=True)
 
-        # 写 nginx + reload
-        self._add_nginx_location(public_path, site_root)
-        status = self._reload_nginx()
-        record = DeployRecord(
-            id=deployment_id, service_name=safe_name, client_name=client_name, client_dir=project_dir,
-            project_type="node", url=f"{self.public_base_url}/{public_path}/",
+    async def _runtime_command(self, *args: str, check: bool = True, timeout: float = 30) -> str:
+        proc = await asyncio.create_subprocess_exec(
+            "docker", *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         )
-        record.mark_running()
-        await self._save_deployment(record, self._deploy_client_id, site_root)
-        return Message(
-            content=f"[Node 项目部署完成] {status}\n源: {project_dir}\n产物: {dist_dir}\n目标: {site_root}\nURL: {self.public_base_url}/{public_path}/",
-            cause_by="deploy_complete", sent_from=self.agent_id,
-            metadata={"action": "deploy_node", "service_name": service_name, "site_url": f"{self.public_base_url}/{public_path}/", "site_root": site_root},
-        )
+        try:
+            out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            proc.kill()
+            await proc.wait()
+            raise
+        if check and proc.returncode:
+            raise RuntimeError("Docker command failed: " + err.decode(errors="replace")[-400:])
+        return out.decode(errors="replace").strip()
+
+    async def _runtime_ip(self, container_name: str, network_name: str) -> str:
+        import ipaddress
+        data = json.loads(await self._runtime_command("inspect", "--format", "{{json .NetworkSettings.Networks}}", container_name))
+        address = str((data.get(network_name) or {}).get("IPAddress") or "")
+        ip = ipaddress.ip_address(address)
+        if ip.version != 4 or not ip.is_private:
+            raise ValueError("runtime network address invalid")
+        return address
+
+    def _add_runtime_location(self, public_path: str, address: str) -> None:
+        import ipaddress
+        ipaddress.IPv4Address(address)
+        if not re.fullmatch(r"c/[a-z0-9_-]+/d[0-9a-f]{12}", public_path):
+            raise ValueError("invalid runtime path")
+        conf = getattr(self, "nginx_conf_path", "/etc/nginx/conf.d/loveboos-ai.conf")
+        with self._nginx_lock:
+            with open(conf) as f:
+                content = f.read()
+            content = re.sub(rf"    # auto-deploy: {re.escape(public_path)}\n    location[^{{]*\{{[^}}]*\}}\n", "", content)
+            block = (f"    # auto-deploy: {public_path}\n"
+                     f"    location /{public_path}/ {{\n"
+                     f"        proxy_pass http://{address}:8000/;\n"
+                     f"        proxy_set_header Host $host;\n"
+                     f"        proxy_set_header X-Forwarded-Proto $scheme;\n"
+                     f"    }}\n")
+            marker = "    # 服务配置将自动添加到此处\n"
+            if marker not in content:
+                raise RuntimeError("nginx configuration marker missing")
+            content = content.replace(marker, marker + block, 1)
+            with open(conf, "w") as f:
+                f.write(content)
+
+    async def refresh_runtime_route(self, record: DeployRecord) -> None:
+        if not re.fullmatch(r"d[0-9a-f]{12}", record.id) or record.container_name != "coagent-app-" + record.id:
+            raise ValueError("invalid runtime deployment")
+        path = urlparse(record.url).path.strip("/")
+        expected_client = self._sanitize_name(record.client_id)
+        if path != f"c/{expected_client}/{record.id}":
+            raise ValueError("runtime route does not belong to client")
+        ip = await self._runtime_ip(record.container_name, "coagent-net-" + record.id)
+        self._add_runtime_location(path, ip)
+        if "成功" not in self._reload_nginx():
+            raise RuntimeError("nginx reload failed")
+
+    async def _runtime_http(self, client, url: str) -> tuple[int, bytes]:
+        async def read():
+            async with client.stream("GET", url) as response:
+                body = bytearray()
+                async for chunk in response.aiter_bytes():
+                    body.extend(chunk)
+                    if len(body) > 65536:
+                        raise RuntimeError("runtime response exceeds 64 KiB")
+                return response.status_code, bytes(body)
+        return await asyncio.wait_for(read(), timeout=5)
 
     async def _deploy_python_project(
-        self, project_dir: str, client_name: str, service_name: str
+        self, project_dir: str, client_name: str, service_name: str, client_id: str = ""
     ) -> Message:
-        """ponytail: Python 项目：跳过（v3 暂不实现完整 Python 部署）。"""
-        return Message(
-            content="Python 项目部署暂未实现，请手动部署或先用 _deploy_static 路径。",
-            cause_by="deploy_skipped", sent_from=self.agent_id,
-        )
+        """Run a stdlib Python service in its own internal, read-only container."""
+        from pathlib import Path
+        import httpx
+        volume = container_name_for(client_id)
+        if not client_id or os.path.realpath(project_dir) != os.path.realpath(f"/var/lib/docker/volumes/{volume}/_data"):
+            return Message(content="Python 工作区不属于当前客户", cause_by="deploy_failed", sent_from=self.agent_id)
+        for root, dirs, files in os.walk(project_dir, followlinks=False):
+            if any(os.path.islink(os.path.join(root, name)) for name in dirs + files):
+                return Message(content="Python 工作区包含符号链接", cause_by="deploy_failed", sent_from=self.agent_id)
+        entry = next((n for n in ("server.py", "app.py", "main.py") if os.path.isfile(os.path.join(project_dir, n))), "")
+        if not entry:
+            return Message(content="Python 项目缺少 server.py、app.py 或 main.py", cause_by="deploy_failed", sent_from=self.agent_id)
+        req = Path(project_dir) / "requirements.txt"
+        requirements = []
+        if req.exists():
+            for line in req.read_text().splitlines():
+                spec = line.strip()
+                if not spec or spec.startswith("#"):
+                    continue
+                if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*==[A-Za-z0-9][A-Za-z0-9_.+-]*", spec):
+                    return Message(content="Python 依赖仅支持 requirements.txt 中固定版本的包名==版本", cause_by="deploy_failed", sent_from=self.agent_id)
+                requirements.append(spec)
+            if len(requirements) > 30:
+                return Message(content="Python 依赖超过 30 项限制", cause_by="deploy_failed", sent_from=self.agent_id)
+        if (Path(project_dir) / "pyproject.toml").exists():
+            return Message(content="Python pyproject 依赖尚不支持隔离安装", cause_by="deploy_failed", sent_from=self.agent_id)
+        deployment_id, _, public_path, _ = self._deployment_target(client_id, service_name)
+        container = "coagent-app-" + deployment_id
+        network = "coagent-net-" + deployment_id
+        deps_volume = "coagent-deps-" + deployment_id
+        init_name = "coagent-init-" + deployment_id
+        install_name = "coagent-install-" + deployment_id
+        url = f"{self.public_base_url}/{public_path}/"
+        route_added = False
+        network_created = False
+        deps_created = False
+        record = None
+        complete = False
+        try:
+            if requirements:
+                await self._runtime_command("volume", "create", deps_volume)
+                deps_created = True
+                await self._runtime_command(
+                    "run", "--rm", "--pull=never", "--name", init_name, "--network", "none", "--user", "0:0",
+                    "--cap-drop", "ALL", "--cap-add", "CHOWN", "--security-opt", "no-new-privileges", "--read-only",
+                    "--mount", f"type=volume,source={deps_volume},target=/deps",
+                    "--entrypoint", "chown", "python:3.12-slim", "65534:65534", "/deps",
+                )
+                await self._runtime_command(
+                    "run", "--rm", "--pull=never", "--name", install_name, "--network", "bridge", "--user", "65534:65534",
+                    "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--read-only",
+                    "--memory", "512m", "--cpus", "1", "--pids-limit", "128",
+                    "--tmpfs", "/tmp:rw,nosuid,nodev,size=256m", "-e", "HOME=/tmp",
+                    "--mount", f"type=volume,source={deps_volume},target=/deps",
+                    "python:3.12-slim", "python", "-m", "pip", "--isolated", "install",
+                    "--only-binary=:all:", "--no-deps", "--no-cache-dir", "--disable-pip-version-check",
+                    "--index-url", "https://pypi.org/simple/", "--target", "/deps", *requirements,
+                    timeout=300,
+                )
+                await self._runtime_command(
+                    "run", "--rm", "--pull=never", "--name", init_name, "--network", "none", "--user", "65534:65534",
+                    "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--read-only",
+                    "--memory", "256m", "--cpus", "1", "--pids-limit", "128",
+                    "--tmpfs", "/tmp:rw,nosuid,nodev,size=64m", "-e", "HOME=/tmp", "-e", "PYTHONPATH=/deps",
+                    "--mount", f"type=volume,source={deps_volume},target=/deps,readonly",
+                    "python:3.12-slim", "python", "-m", "pip", "check", timeout=60,
+                )
+            await self._runtime_command("network", "create", "--internal", network)
+            network_created = True
+            command = [
+                "run", "-d", "--pull=never", "--name", container, "--network", network,
+                "--restart", "unless-stopped", "--user", "65534:65534", "--cap-drop", "ALL",
+                "--security-opt", "no-new-privileges", "--read-only", "--memory", "512m", "--cpus", "1",
+                "--pids-limit", "128", "--tmpfs", "/tmp:rw,nosuid,nodev,size=64m",
+                "-e", "PORT=8000", "-e", "PYTHONDONTWRITEBYTECODE=1",
+                "--mount", f"type=volume,source={volume},target=/workspace,readonly",
+            ]
+            if deps_created:
+                command.extend(["-e", "PYTHONPATH=/deps", "--mount", f"type=volume,source={deps_volume},target=/deps,readonly"])
+            command.extend(["-w", "/workspace", "python:3.12-slim", "python", entry])
+            await self._runtime_command(*command)
+            address = await self._runtime_ip(container, network)
+            async with httpx.AsyncClient(timeout=3, trust_env=False, follow_redirects=False) as client:
+                for _ in range(20):
+                    try:
+                        local_status, local_body = await self._runtime_http(client, f"http://{address}:8000/")
+                        if local_status == 200:
+                            break
+                    except httpx.HTTPError:
+                        pass
+                    await asyncio.sleep(0.5)
+                else:
+                    raise RuntimeError("Python 服务未在端口 8000 提供可用的根路径")
+                self._add_runtime_location(public_path, address)
+                route_added = True
+                if "成功" not in self._reload_nginx():
+                    raise RuntimeError("Nginx 配置或重载失败")
+                for _ in range(10):
+                    try:
+                        public_status, public_body = await self._runtime_http(client, url)
+                        if public_status == 200 and public_body == local_body:
+                            break
+                    except httpx.HTTPError:
+                        pass
+                    await asyncio.sleep(0.3)
+                else:
+                    raise RuntimeError("公开 HTTPS 路由未返回相同内容")
+            record = DeployRecord(id=deployment_id, service_name=deployment_id, client_id=client_id,
+                                  client_name=client_name, client_dir=project_dir, project_type="python",
+                                  container_name=container, url=url)
+            record.mark_running()
+            await self._save_deployment(record, client_id)
+            await self.monitor.start_monitoring(record)
+            complete = True
+            return Message(content=f"Python 服务已部署：{url}", cause_by="deploy_complete", sent_from=self.agent_id,
+                           metadata={"action":"runtime_deploy", "site_url":url, "url":url,
+                                     "container_name":container, "files":[entry], "passed":True})
+        except Exception as exc:
+            logger.error("Python 部署失败: %s", type(exc).__name__)
+            return Message(content=f"Python 部署失败: {str(exc)[:300]}", cause_by="deploy_failed", sent_from=self.agent_id)
+        finally:
+            if not complete:
+                if route_added:
+                    try:
+                        self._remove_static_location(public_path)
+                        self._reload_nginx()
+                    except Exception:
+                        logger.exception("Python 部署路由回滚失败")
+                try:
+                    if network_created:
+                        await asyncio.shield(self._runtime_command("rm", "-f", container, check=False))
+                        await asyncio.shield(self._runtime_command("network", "rm", network, check=False))
+                    if deps_created:
+                        await asyncio.shield(self._runtime_command("rm", "-f", init_name, check=False))
+                        await asyncio.shield(self._runtime_command("rm", "-f", install_name, check=False))
+                        await asyncio.shield(self._runtime_command("volume", "rm", deps_volume, check=False))
+                    if record is not None:
+                        record.mark_failed("部署未完成，资源已回滚")
+                        await asyncio.shield(self._save_deployment(record, client_id))
+                except Exception:
+                    logger.exception("Python 部署容器回滚失败")
 
     def _add_nginx_location(self, safe_name: str, site_root: str) -> None:
         """ponytail: 写 location 块到现有 loveboos-ai.conf 的 marker 后。"""
@@ -530,10 +814,9 @@ class DevOpsAgent(BaseAgent):
         )
         location_block = (
             f"    # auto-deploy: {safe_name}\n"
-            f"    location /{safe_name} {{\n"
-            f"        alias {site_root};\n"
+            f"    location /{safe_name}/ {{\n"
+            f"        alias {site_root}/;\n"
             f"        index index.html;\n"
-            f"        try_files $uri $uri/ =404;\n"
             f"    }}\n"
         )
         m = "    # 服务配置将自动添加到此处\n"
@@ -543,6 +826,15 @@ class DevOpsAgent(BaseAgent):
             content += location_block
         with open(nginx_conf, "w") as f:
             f.write(content)
+
+    def _remove_static_location(self, name: str) -> None:
+        conf = getattr(self, "nginx_conf_path", "/etc/nginx/conf.d/loveboos-ai.conf")
+        with self._nginx_lock:
+            with open(conf) as f:
+                content = f.read()
+            content = re.sub(rf"    # auto-deploy: {re.escape(name)}\n    location[^{{]*\{{[^}}]*\}}\n", "", content)
+            with open(conf, "w") as f:
+                f.write(content)
 
     def _reload_nginx(self) -> str:
         """ponytail: nginx -t + reload。"""
@@ -556,7 +848,7 @@ class DevOpsAgent(BaseAgent):
             return f"nginx reload 失败: {err[:300]}"
 
     async def _deploy_static(
-        self, project_dir: str, client_name: str, service_name: str
+        self, project_dir: str, client_name: str, service_name: str, client_id: str = ""
     ) -> Message:
         """
         ponytail: 快速静态部署——跳过 Docker，直接 nginx 静态托管。
@@ -566,16 +858,18 @@ class DevOpsAgent(BaseAgent):
         import subprocess
 
         # 目标路径：/var/www/muzhu-ai/{service_name}
-        client_id = getattr(self, "_deploy_client_id", "") or client_name
+        client_id = client_id or client_name
         deployment_id, safe_name, public_path, site_root = self._deployment_target(client_id, service_name)
-        os.makedirs(site_root, exist_ok=True)
-
-        # 复制 index.html + 任何附属文件
-        for fname in os.listdir(project_dir):
-            src = os.path.join(project_dir, fname)
-            dst = os.path.join(site_root, fname)
-            if os.path.isfile(src):
-                shutil.copy2(src, dst)
+        if not os.path.isfile(os.path.join(project_dir, "index.html")):
+            return Message(content="静态产物缺少 index.html", cause_by="deploy_failed", sent_from=self.agent_id)
+        for root, dirs, files in os.walk(project_dir, followlinks=False):
+            if any(os.path.islink(os.path.join(root, n)) for n in dirs + files):
+                return Message(content="静态产物含符号链接", cause_by="deploy_failed", sent_from=self.agent_id)
+        shutil.copytree(project_dir, site_root)
+        for root, dirs, files in os.walk(site_root):
+            os.chmod(root, 0o755)
+            for filename in files:
+                os.chmod(os.path.join(root, filename), 0o644)
 
         # 写 nginx location 块——必须是 server 块内的合法指令
         # （直接 append 到 conf.d 文件末尾会落在 server 块之外，nginx -t 报错）
@@ -590,15 +884,36 @@ class DevOpsAgent(BaseAgent):
                 ["systemctl", "reload", "nginx"], check=True, capture_output=True, timeout=10
             )
             status_msg = f"已部署到 {self.public_base_url}/{public_path}/"
-        except subprocess.CalledProcessError as e:
-            status_msg = f"nginx reload 失败: {e.stderr.decode() if e.stderr else e}"
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as e:
+            self._remove_static_location(public_path)
+            shutil.rmtree(site_root, ignore_errors=True)
+            return Message(content=f"nginx reload 失败: {e}", cause_by="deploy_failed", sent_from=self.agent_id)
+
+        try:
+            import httpx
+            import hashlib
+            host = urlparse(self.public_base_url).hostname or "localhost"
+            async with httpx.AsyncClient(verify=False, trust_env=False, timeout=5) as client:
+                expected = open(os.path.join(site_root, "index.html"), "rb").read()
+                for attempt in range(10):
+                    response = await client.get(f"https://127.0.0.1/{public_path}/", headers={"Host": host, "Connection": "close"})
+                    if response.status_code == 200 and hashlib.sha256(response.content).digest() == hashlib.sha256(expected).digest():
+                        break
+                    await asyncio.sleep(0.3)
+                else:
+                    raise RuntimeError(f"访问检查不匹配 (HTTP {response.status_code})")
+        except Exception as exc:
+            self._remove_static_location(public_path)
+            self._reload_nginx()
+            shutil.rmtree(site_root, ignore_errors=True)
+            return Message(content=f"部署访问检查失败: {exc}", cause_by="deploy_failed", sent_from=self.agent_id)
 
         record = DeployRecord(
             id=deployment_id, service_name=safe_name, client_name=client_name, client_dir=project_dir,
             project_type="static", url=f"{self.public_base_url}/{public_path}/",
         )
         record.mark_running()
-        await self._save_deployment(record, self._deploy_client_id, site_root)
+        await self._save_deployment(record, client_id, site_root)
         return Message(
             content=f"[静态部署完成] {status_msg}\n源: {project_dir}\n目标: {site_root}",
             cause_by="deploy_complete",
@@ -608,6 +923,8 @@ class DevOpsAgent(BaseAgent):
                 "service_name": service_name,
                 "site_url": f"{self.public_base_url}/{public_path}/",
                 "site_root": site_root,
+                "passed": True,
+                "acceptance_text": "静态入口已部署；业务功能未自动验收",
             },
         )
 
@@ -791,7 +1108,7 @@ class DevOpsAgent(BaseAgent):
             return False
         volume_root = "/var/lib/docker/volumes/"
         source_root = "/var/www/muzhu-ai/sources/"
-        if real.startswith(volume_root) and real.endswith("/_data"):
+        if client_id and real == os.path.realpath(os.path.join(volume_root, container_name_for(client_id), "_data")):
             return True
         expected = os.path.realpath(os.path.join(source_root, self._sanitize_name(client_id)))
         return bool(client_id) and (real == expected or real.startswith(expected + os.sep))

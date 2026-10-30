@@ -19,7 +19,6 @@ from config.settings import settings
 
 logger = logging.getLogger(__name__)
 
-_http_client: Optional[httpx.AsyncClient] = None
 _COLUMN_FILTERS = {"agent_id", "agent_role", "memory_type"}
 
 
@@ -44,20 +43,17 @@ async def _embed_text(text: str) -> List[float]:
     if not settings.DASHSCOPE_API_KEY:
         raise RuntimeError("DASHSCOPE_API_KEY 未配置")
 
-    global _http_client
-    if _http_client is None or _http_client.is_closed:
-        _http_client = httpx.AsyncClient(timeout=30.0)
-
     url = f"{settings.DASHSCOPE_BASE_URL.rstrip('/')}/embeddings"
-    response = await _http_client.post(
-        url,
-        headers={"Authorization": f"Bearer {settings.DASHSCOPE_API_KEY}"},
-        json={
-            "model": settings.DASHSCOPE_EMBEDDING_MODEL,
-            "input": text,
-            "dimensions": settings.DASHSCOPE_EMBEDDING_DIMENSIONS,
-        },
-    )
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await client.post(
+            url,
+            headers={"Authorization": f"Bearer {settings.DASHSCOPE_API_KEY}"},
+            json={
+                "model": settings.DASHSCOPE_EMBEDDING_MODEL,
+                "input": text,
+                "dimensions": settings.DASHSCOPE_EMBEDDING_DIMENSIONS,
+            },
+        )
     response.raise_for_status()
     vector = response.json()["data"][0]["embedding"]
     expected = settings.DASHSCOPE_EMBEDDING_DIMENSIONS

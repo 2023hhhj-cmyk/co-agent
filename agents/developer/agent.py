@@ -190,6 +190,15 @@ class DeveloperAgent(BaseAgent):
             title, ok, done, notes, outputs, acceptance, acceptance_text, summary,
         ))
         body = f"结果文档：{result_path}\n\n{summary}"
+        # Acceptance may mention existing supporting files not named as plan outputs.
+        evidence_files = []
+        for match in _FILE_RE.findall(acceptance):
+            rel = self._safe_rel(match)
+            if rel and all(part and not part.startswith(".") for part in rel.split("/")) and rel not in evidence_files:
+                if await files.exists(os.path.join(client_dir, rel)):
+                    evidence_files.append(rel)
+                if len(evidence_files) >= 8:
+                    break
         return Message(
             content=body,
             cause_by="developer_result" if ok else "error",
@@ -203,6 +212,7 @@ class DeveloperAgent(BaseAgent):
                 "task_id": task_id,
                 "ok": ok,
                 "files": [rel_path(p, client_dir, "/workspace") for p in outputs.values() if p],
+                "evidence_files": evidence_files,
                 "acceptance_text": acceptance_text,
                 "passed": ok,
                 "error": "" if ok else acceptance_text,

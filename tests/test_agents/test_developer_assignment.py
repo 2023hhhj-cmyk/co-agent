@@ -144,3 +144,18 @@ async def test_cyclic_plan_does_not_call_opencode(tmp_path):
     assert code.calls == []
     text = Path(result.metadata["result_path"]).read_text(encoding="utf-8")
     assert "循环依赖" in text
+
+
+@pytest.mark.asyncio
+async def test_acceptance_existing_supporting_files_are_evidence_not_claimed_outputs(tmp_path):
+    class MultiFileCode(FakeCode):
+        async def execute(self, task, working_dir=None, context=None, volume=None):
+            result = await super().execute(task,working_dir,context,volume)
+            (Path(working_dir) / "build.js").write_text("console.log(1)", encoding="utf-8")
+            return result
+    dev=agent(tmp_path,ScriptLLM({"items":[{"name":"manifest","detail":"write","depends_on":[],"output_file":"package.json"}]}),MultiFileCode())
+    result=await dev.run(assignment(tmp_path,acceptance="交付 package.json 和 build.js，构建生成 dist/index.html"))
+    assert result.cause_by=="developer_result"
+    assert result.metadata["files"]==["package.json"]
+    assert "build.js" in result.metadata["evidence_files"]
+    assert "dist/index.html" not in result.metadata["evidence_files"]

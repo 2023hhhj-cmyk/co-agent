@@ -237,6 +237,13 @@ class SandboxedExecutor:
                     "--auto",
                     "--dir", "/workspace",
                 ]
+                if settings.OPENCODE_MODEL == "opencode-go/deepseek-v4.1-flash":
+                    # The gateway accepts this model, but this OpenCode version omits it from its catalog.
+                    model_config = {"provider": {"opencode-go": {"models": {
+                        "deepseek-v4.1-flash": {"name": "DeepSeek V4.1 Flash"}
+                    }}}}
+                    image_index = cmd.index(self.docker_image)
+                    cmd[image_index:image_index] = ["--env", "OPENCODE_CONFIG_CONTENT=" + json.dumps(model_config)]
                 process = await asyncio.create_subprocess_exec(
                     *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
                 )

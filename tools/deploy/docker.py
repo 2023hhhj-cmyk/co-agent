@@ -71,15 +71,15 @@ class PortManager:
                 try:
                     await self.database.execute(
                         "INSERT INTO deployments "
-                        "(service_name, kind, port, status, updated_at) "
-                        "VALUES ($1, 'docker', $2, 'deploying', NOW()) "
+                        "(service_name, deployment_id, kind, port, status, updated_at) "
+                        "VALUES ($1, $1, 'docker', $2, 'deploying', NOW()) "
                         "ON CONFLICT (service_name) DO UPDATE SET "
                         "port = EXCLUDED.port, kind = 'docker', "
                         "status = 'deploying', updated_at = NOW() "
                         "WHERE deployments.status = 'stopped' "
                         "OR deployments.port = 0 "
                         "OR deployments.port = EXCLUDED.port",
-                        service_name, port,
+                        deployment_id, port,
                     )
                 except Exception as exc:
                     logger.info("port %s claim failed: %s", port, exc)
@@ -88,12 +88,12 @@ class PortManager:
                     "SELECT port FROM deployments "
                     "WHERE service_name = $1 AND port = $2 "
                     "AND status <> 'stopped'",
-                    service_name, port,
+                    deployment_id, port,
                 )
                 if not row:
                     continue
             self.allocated[port] = deployment_id
-            logger.info("allocated port %s for %s", port, service_name)
+            logger.info("allocated port %s for %s", port, deployment_id)
             return port
 
         raise RuntimeError(f"no free port in {self.start}-{self.end}")

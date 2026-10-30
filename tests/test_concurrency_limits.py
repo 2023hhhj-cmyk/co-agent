@@ -1,6 +1,7 @@
 """Behavior checks for workspace job admission and shared model quotas."""
 import asyncio
 from unittest.mock import AsyncMock, MagicMock
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -23,7 +24,7 @@ def workflow(handler, count=4):
         for i in range(count)
     ])
     graph = WorkflowGraph(PlanToGraphConverter().convert(plan))
-    agents = {t.assigned_to: MagicMock(run=handler) for t in plan.tasks}
+    agents = {t.assigned_to: SimpleNamespace(run=handler) for t in plan.tasks}
     return WorkflowExecutor(graph, agents)
 
 

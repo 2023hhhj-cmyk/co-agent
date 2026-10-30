@@ -1,5 +1,6 @@
 """Regression checks for exception preservation and truthful workflow reports."""
 from unittest.mock import AsyncMock, MagicMock, patch
+from types import SimpleNamespace
 
 import pytest
 
@@ -71,7 +72,7 @@ async def test_real_workflow_failures_reach_plan_and_report(failures, status, he
     plan = ProjectPlan(requirement="test", tasks=tasks)
     ceo.team = {}
     for i, task in enumerate(tasks):
-        ceo.team[task.assigned_to] = MagicMock(run=AsyncMock(
+        ceo.team[task.assigned_to] = SimpleNamespace(run=AsyncMock(
             side_effect=ValueError(f"failure-{i}") if i < failures else None,
             return_value=Message(content=f"output-{i}"),
         ))
@@ -119,7 +120,7 @@ async def test_failed_dependency_skips_descendants_and_preserves_independent_bra
         for name, deps in specs
     ])
     ceo.team = {
-        name: MagicMock(run=AsyncMock(
+        name: SimpleNamespace(run=AsyncMock(
             side_effect=ValueError("A failed") if fail and name == "A" else None,
             return_value=Message(content=f"result {name}"),
         ))
@@ -153,3 +154,33 @@ async def test_failed_dependency_skips_descendants_and_preserves_independent_bra
     notices = [c.args[1] for c in ceo._send_feishu_text.await_args_list]
     for name in skipped:
         assert f"✅ 任务 [{name}] 已完成" not in notices
+
+async def test_agent_fork_keeps_shared_services_and_isolates_task_state():
+    agent = MinimalAgent(AgentRole(name="regression"))
+    first = agent.fork("client-a")
+    second = agent.fork("client-b")
+    assert first is not agent and second is not first
+    assert first.agent_id != second.agent_id
+    assert first.memory_owner_id != second.memory_owner_id
+    assert first.role is agent.role
+    first.memory.append(Message(content="client-a"))
+    assert second.memory == [] and agent.memory == []
+    assert first.message_queue is not second.message_queue
+
+
+async def test_executor_forks_agent_for_customer_before_running():
+    from workflows.converter import PlanToGraphConverter
+    from workflows.executor import WorkflowExecutor
+    from workflows.graph import WorkflowGraph
+
+    task = Task(title="work", description="run", assigned_to="developer")
+    graph = WorkflowGraph(PlanToGraphConverter().convert(ProjectPlan(requirement="test", tasks=[task])))
+    child = SimpleNamespace(run=AsyncMock(return_value=Message(content="done")))
+    parent = SimpleNamespace(fork=MagicMock(return_value=child), run=AsyncMock())
+    result = await WorkflowExecutor(graph, {"developer": parent}).execute(
+        Message(content="test"), extra_context={"client_id": "customer-123"}
+    )
+    parent.fork.assert_called_once_with("customer-123")
+    parent.run.assert_not_awaited()
+    child.run.assert_awaited_once()
+    assert result["outputs"][task.id]["content"] == "done"

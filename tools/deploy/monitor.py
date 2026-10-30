@@ -146,9 +146,25 @@ class ServiceMonitor:
             )
 
         # 2. HTTP 健康检查
-        url = f"http://127.0.0.1:{service.port}{service.health_check_path}"
+        if service.container_name.startswith("coagent-app-d"):
+            import ipaddress
+            import json
+            try:
+                deployment_id = service.container_name.removeprefix("coagent-app-")
+                result = await self.docker._run_command([
+                    "docker", "inspect", "--format", "{{json .NetworkSettings.Networks}}", service.container_name,
+                ])
+                networks = json.loads(result.stdout)
+                address = networks["coagent-net-" + deployment_id]["IPAddress"]
+                if not ipaddress.IPv4Address(address).is_private:
+                    raise ValueError("invalid runtime address")
+                url = f"http://{address}:8000{service.health_check_path}"
+            except Exception:
+                return ServiceHealth(status=HealthStatus.UNHEALTHY, error="无法读取运行容器网络地址")
+        else:
+            url = f"http://127.0.0.1:{service.port}{service.health_check_path}"
         try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
+            async with httpx.AsyncClient(timeout=10.0, trust_env=False) as client:
                 start_time = datetime.now()
                 response = await client.get(url)
                 end_time = datetime.now()

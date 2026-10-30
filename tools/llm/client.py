@@ -101,7 +101,8 @@ class LLMClient(ABC):
 
     def _build_prompt_string(self, messages: List[Dict[str, str]]) -> str:
         """构建 prompt 字符串用于缓存 key"""
-        return "\n".join(f"{m['role']}:{m.get('content', '')[:200]}" for m in messages[-10:])
+        # Full messages prevent different long requirements or earlier context sharing a cache key.
+        return json.dumps(messages, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
     async def chat(
         self,

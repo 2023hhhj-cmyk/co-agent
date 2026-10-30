@@ -196,3 +196,20 @@ async def test_jitter_is_applied_to_retry_delay(retry_setup, monkeypatch):
     client._chat_impl = AsyncMock(side_effect=[httpx.ReadTimeout("timeout"), "answer"])
     assert await client.chat([{"role": "user", "content": "hello"}]) == "answer"
     assert sleeping.await_args.args[0] == 1.25
+
+
+def test_cache_key_uses_full_messages_and_all_history():
+    from tools.llm.client import DeepSeekClient
+    from acceleration.cache import ResponseCache
+    client=DeepSeekClient(api_key="test",model="test")
+    prefix="a"*200
+    first=[{"role":"user","content":prefix+"first"}]
+    second=[{"role":"user","content":prefix+"second"}]
+    first_prompt=client._build_prompt_string(first)
+    second_prompt=client._build_prompt_string(second)
+    assert first_prompt != second_prompt
+    cache=ResponseCache()
+    assert cache._cache_key(first_prompt,"test",0.3) != cache._cache_key(second_prompt,"test",0.3)
+    history=[{"role":"user","content":"old-first"}]+[{"role":"user","content":str(i)} for i in range(10)]
+    changed=[{"role":"user","content":"old-second"}]+history[1:]
+    assert client._build_prompt_string(history) != client._build_prompt_string(changed)

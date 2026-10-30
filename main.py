@@ -425,9 +425,9 @@ async def api_key_middleware(request: Request, call_next):
     if any(request.url.path.startswith(p) for p in webhook_prefixes):
         return await call_next(request)
 
-    # 开发模式：未配置 API_KEY 时放行（向后兼容）
+    # 缺少密钥时拒绝受保护接口，避免生产环境意外裸奔。
     if not settings.API_KEY:
-        return await call_next(request)
+        return JSONResponse(status_code=503, content={"error": "API authentication is not configured"})
 
     # 验证 X-API-Key
     api_key = request.headers.get("X-API-Key")
@@ -566,9 +566,11 @@ async def create_requirement(requirement: dict):
         await ceo._execute_plan(client_id, plan)
 
         return {
-            "status": "success",
+            "status": plan.status,
             "plan_id": plan.id,
             "tasks": [t.to_summary() for t in plan.tasks],
+            "task_details": [{"id": t.id, "title": t.title, "status": t.status.value,
+                              "error": t.error} for t in plan.tasks],
         }
     except Exception as e:
         logger.error(f"需求处理失败: {e}", exc_info=True)
@@ -641,11 +643,20 @@ async def restart_devops_service(deployment_id: str, client_id: str = ""):
     if not service:
         return {"error": "Deployment not found"}
     success = await devops.docker.restart(service.container_name)
+    if success and service.container_name.startswith("coagent-app-d"):
+        try:
+            await devops.refresh_runtime_route(service)
+            service.mark_running()
+            await devops._save_deployment(service, client_id)
+            await devops.monitor.start_monitoring(service)
+        except Exception:
+            logger.exception("运行服务重启后恢复路由失败")
+            return {"status": "error", "message": "Service restarted but route recovery failed"}
 
     if success:
-        return {"status": "success", "message": f"Service {service_name} restarted"}
+        return {"status": "success", "message": f"Service {service.service_name} restarted"}
     else:
-        return {"status": "error", "message": f"Failed to restart service {service_name}"}
+        return {"status": "error", "message": f"Failed to restart service {service.service_name}"}
 
 
 @app.post("/api/devops/deployments/{deployment_id}/stop")
@@ -673,13 +684,22 @@ async def stop_devops_service(deployment_id: str, client_id: str = ""):
         await devops.port_manager.release(service.port)
         service.mark_stopped()
         await devops._save_deployment(service)
-        # 删除 Nginx 配置
-        await devops.nginx.remove_service(deployment_id)
-        await devops.nginx.reload()
+        # 删除该部署的路由；运行服务使用客户前缀路径。
+        if service.container_name.startswith("coagent-app-d"):
+            from urllib.parse import urlsplit
+            expected = f"c/{devops._sanitize_name(client_id)}/{deployment_id}"
+            if urlsplit(service.url).path.strip("/") != expected:
+                return {"status": "error", "message": "Invalid deployment route"}
+            devops._remove_static_location(expected)
+            if "成功" not in devops._reload_nginx():
+                return {"status": "error", "message": "Nginx reload failed"}
+        else:
+            await devops.nginx.remove_service(deployment_id)
+            await devops.nginx.reload()
 
-        return {"status": "success", "message": f"Service {service_name} stopped"}
+        return {"status": "success", "message": f"Service {service.service_name} stopped"}
     else:
-        return {"status": "error", "message": f"Failed to stop service {service_name}"}
+        return {"status": "error", "message": f"Failed to stop service {service.service_name}"}
 
 
 @app.post("/api/feishu/webhook")
